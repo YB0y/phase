@@ -653,6 +653,7 @@ pub fn process_triggers(state: &mut GameState, events: &[GameEvent]) {
                         Effect::Sacrifice {
                             target: TargetFilter::SelfRef,
                             count: QuantityExpr::Fixed { value: 1 },
+                            min_count: 0,
                         },
                     );
                     let decayed_effect = Effect::CreateDelayedTrigger {
@@ -5931,6 +5932,7 @@ pub mod tests {
         let effect = Effect::Sacrifice {
             target: TargetFilter::Typed(TypedFilter::creature()),
             count: QuantityExpr::Fixed { value: 1 },
+            min_count: 0,
         };
         assert!(
             extract_target_filter_from_effect(&effect).is_none(),

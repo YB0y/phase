@@ -3771,6 +3771,11 @@ pub enum Effect {
         /// from `optional: true` on the ability ("you may sacrifice").
         #[serde(default = "default_quantity_one")]
         count: QuantityExpr,
+        /// CR 107.1c: Minimum number of permanents to choose for ranged
+        /// sacrifice effects. Defaults to 0 for ordinary "up to" choices; set
+        /// to 1 for "one or more" choices.
+        #[serde(default, skip_serializing_if = "is_zero_usize")]
+        min_count: usize,
     },
     DiscardCard {
         #[serde(default = "default_one")]
@@ -5000,6 +5005,10 @@ fn default_one() -> u32 {
 
 fn default_one_i32() -> i32 {
     1
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 fn default_player_filter_controller() -> PlayerFilter {

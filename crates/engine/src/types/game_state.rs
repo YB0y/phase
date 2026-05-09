@@ -43,6 +43,10 @@ fn is_zero_u32(value: &u32) -> bool {
     *value == 0
 }
 
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
 fn default_remaining_one() -> u32 {
     1
 }
@@ -1223,6 +1227,10 @@ pub enum WaitingFor {
         player: PlayerId,
         cards: Vec<ObjectId>,
         count: usize,
+        /// CR 107.1c: Minimum number of cards that must be selected when a
+        /// choice allows a range. Defaults to 0 for ordinary "up to" choices.
+        #[serde(default, skip_serializing_if = "is_zero_usize")]
+        min_count: usize,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         up_to: bool,
         source_id: ObjectId,
@@ -3926,6 +3934,7 @@ mod tests {
             player: PlayerId(0),
             cards: vec![ObjectId(1)],
             count: 1,
+            min_count: 0,
             up_to: false,
             source_id: ObjectId(100),
             effect_kind: crate::types::ability::EffectKind::Sacrifice,
@@ -4151,6 +4160,7 @@ mod tests {
             player: PlayerId(0),
             cards: vec![ObjectId(1), ObjectId(2)],
             count: 1,
+            min_count: 0,
             up_to: true,
             source_id: ObjectId(10),
             effect_kind: crate::types::ability::EffectKind::ChangeZone,

@@ -10981,7 +10981,7 @@ mod tests {
 
         let execute = def.execute.as_deref().expect("execute ability");
         match &*execute.effect {
-            Effect::Sacrifice { target, count } => {
+            Effect::Sacrifice { target, count, .. } => {
                 assert_eq!(*count, QuantityExpr::Fixed { value: 1 });
                 assert_eq!(
                     *target,

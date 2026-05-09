@@ -693,6 +693,34 @@ fn strip_sacrifice_count_suffix(target_text: &str) -> String {
     }
 }
 
+/// CR 701.21a + CR 107.1c: Parse "one or more [objects]" sacrifice choices.
+/// `UpTo(ObjectCount(filter))` provides the dynamic upper bound, while
+/// `min_count = 1` preserves the printed lower bound after the player accepts
+/// the surrounding optional action.
+fn parse_one_or_more_sacrifice(
+    text: &str,
+    ctx: &mut ParseContext,
+) -> Option<(QuantityExpr, TargetFilter, usize)> {
+    let lower = text.to_lowercase();
+    let (_, filter_text) = nom_on_lower(text, &lower, |input| {
+        value((), tag("one or more ")).parse(input)
+    })?;
+    let target_text = strip_sacrifice_count_suffix(&strip_sacrifice_choice_marker(
+        strip_article(filter_text.trim_start()).trim_end_matches('.'),
+    ));
+    let (mut target, remainder) = parse_type_phrase(target_text.trim());
+    if !remainder.trim().is_empty() || matches!(target, TargetFilter::Any) {
+        return None;
+    }
+    apply_actor_default(&mut target, ctx);
+    let count = QuantityExpr::up_to(QuantityExpr::Ref {
+        qty: QuantityRef::ObjectCount {
+            filter: target.clone(),
+        },
+    });
+    Some((count, target, 1))
+}
+
 /// NOTE: Shares verb prefixes with `try_parse_verb_and_target` in `mod.rs`.
 /// When adding a new targeted verb here, check if it also needs to be added there
 /// (for compound action splitting like "tap target creature and put a counter on it").
@@ -726,6 +754,13 @@ pub(super) fn parse_targeted_action_ast(
     if let Some((_, rest)) = nom_on_lower(text, lower, |input| {
         value((), tag("sacrifice ")).parse(input)
     }) {
+        if let Some((count, target, min_count)) = parse_one_or_more_sacrifice(rest, ctx) {
+            return Some(TargetedImperativeAst::Sacrifice {
+                target,
+                count,
+                min_count,
+            });
+        }
         let (count, after_count) = super::super::oracle_util::parse_count_expr(rest).unwrap_or((
             crate::types::ability::QuantityExpr::Fixed { value: 1 },
             rest,
@@ -781,7 +816,11 @@ pub(super) fn parse_targeted_action_ast(
         // sacrifice a non-Demon creature" must restrict the prompt to the
         // actor's permanents — sacrificing requires controlling the permanent.
         apply_actor_default(&mut target, ctx);
-        return Some(TargetedImperativeAst::Sacrifice { target, count });
+        return Some(TargetedImperativeAst::Sacrifice {
+            target,
+            count,
+            min_count: 0,
+        });
     }
     // Simple targeted verbs: tap, untap — parse target after verb prefix
     if let Some((verb, rest)) = nom_on_lower(text, lower, |input| {
@@ -1107,7 +1146,15 @@ pub(super) fn lower_targeted_action_ast(ast: TargetedImperativeAst) -> Effect {
         TargetedImperativeAst::Untap { target } => Effect::Untap { target },
         TargetedImperativeAst::TapAll { target } => Effect::TapAll { target },
         TargetedImperativeAst::UntapAll { target } => Effect::UntapAll { target },
-        TargetedImperativeAst::Sacrifice { target, count } => Effect::Sacrifice { target, count },
+        TargetedImperativeAst::Sacrifice {
+            target,
+            count,
+            min_count,
+        } => Effect::Sacrifice {
+            target,
+            count,
+            min_count,
+        },
         // CR 701.9b + CR 608.2d: Lower the AST `up_to: bool` into the typed
         // `count: QuantityExpr::UpTo { max }` wrapper.
         TargetedImperativeAst::Discard {
@@ -5526,6 +5573,48 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_sacrifice_one_or_more_uses_filtered_up_to_count() {
+        let text = "sacrifice one or more Treasures";
+        let lower = text.to_lowercase();
+        let mut ctx = ParseContext {
+            actor: Some(ControllerRef::You),
+            ..Default::default()
+        };
+        let result =
+            parse_targeted_action_ast(text, &lower, &mut ctx).expect("sacrifice should parse");
+        match lower_targeted_action_ast(result) {
+            Effect::Sacrifice {
+                target,
+                count,
+                min_count,
+            } => {
+                assert_eq!(min_count, 1);
+                match &target {
+                    TargetFilter::Typed(tf) => {
+                        assert_eq!(tf.controller, Some(ControllerRef::You));
+                        assert!(tf.type_filters.iter().any(|type_filter| matches!(
+                            type_filter,
+                            crate::types::ability::TypeFilter::Subtype(subtype)
+                                if subtype == "Treasure"
+                        )));
+                    }
+                    other => panic!("expected Typed target, got {other:?}"),
+                }
+                match count {
+                    QuantityExpr::UpTo { max } => match *max {
+                        QuantityExpr::Ref {
+                            qty: QuantityRef::ObjectCount { filter },
+                        } => assert_eq!(filter, target),
+                        other => panic!("expected ObjectCount max, got {other:?}"),
+                    },
+                    other => panic!("expected UpTo count, got {other:?}"),
+                }
+            }
+            other => panic!("expected Effect::Sacrifice, got {other:?}"),
+        }
+    }
+
     // CR 701.21a: Symmetric handling — "an opponent (may) sacrifices [filter]"
     // routes ControllerRef::Opponent into the parsed Sacrifice target.
     #[test]
@@ -5951,7 +6040,7 @@ mod tests {
         let lower = text.to_lowercase();
         let result = parse_targeted_action_ast(text, &lower, &mut ParseContext::default());
         match result {
-            Some(TargetedImperativeAst::Sacrifice { target, count }) => {
+            Some(TargetedImperativeAst::Sacrifice { target, count, .. }) => {
                 assert!(matches!(
                     count,
                     QuantityExpr::DivideRounded {
@@ -5989,7 +6078,7 @@ mod tests {
         let mut ctx = ParseContext::default();
         let result = parse_targeted_action_ast(text, &lower, &mut ctx);
         match result {
-            Some(TargetedImperativeAst::Sacrifice { target, count }) => {
+            Some(TargetedImperativeAst::Sacrifice { target, count, .. }) => {
                 assert!(matches!(
                     count,
                     QuantityExpr::DivideRounded {

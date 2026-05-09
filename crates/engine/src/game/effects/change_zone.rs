@@ -485,6 +485,7 @@ pub fn resolve(
             player: filter_controller,
             cards: eligible,
             count: 1,
+            min_count: 0,
             up_to,
             source_id: ability.source_id,
             effect_kind: EffectKind::ChangeZone,
@@ -2001,6 +2002,7 @@ mod tests {
                 Effect::Sacrifice {
                     target: TargetFilter::ParentTargetSlot { index: 0 },
                     count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                    min_count: 0,
                 },
                 vec![],
                 ObjectId(200),

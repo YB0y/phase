@@ -11075,6 +11075,7 @@ mod phase_trigger_regression_tests {
             Effect::Sacrifice {
                 target: TargetFilter::Any,
                 count: QuantityExpr::Fixed { value: 1 },
+                min_count: 0,
             },
             vec![],
             source_id,
@@ -11309,6 +11310,7 @@ mod phase_trigger_regression_tests {
             Effect::Sacrifice {
                 target: TargetFilter::Any,
                 count: QuantityExpr::Fixed { value: 1 },
+                min_count: 0,
             },
             vec![TargetRef::Player(PlayerId(0))],
             source_id,
@@ -11359,6 +11361,7 @@ mod phase_trigger_regression_tests {
             player: PlayerId(0),
             cards: vec![obj_id],
             count: 1,
+            min_count: 0,
             up_to: false,
             source_id,
             effect_kind: EffectKind::Sacrifice,
@@ -11394,6 +11397,40 @@ mod phase_trigger_regression_tests {
         assert!(state.players[0].graveyard.contains(&obj_id));
         assert_eq!(state.players[0].life, 22);
         assert_eq!(state.last_effect_count, Some(1));
+    }
+
+    #[test]
+    fn effect_zone_choice_up_to_respects_min_count() {
+        let mut state = setup_game_at_main_phase();
+        let source_id = ObjectId(100);
+        let obj_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Chosen Permanent".to_string(),
+            Zone::Battlefield,
+        );
+        state.waiting_for = WaitingFor::EffectZoneChoice {
+            player: PlayerId(0),
+            cards: vec![obj_id],
+            count: 1,
+            min_count: 1,
+            up_to: true,
+            source_id,
+            effect_kind: EffectKind::Sacrifice,
+            zone: Zone::Battlefield,
+            destination: None,
+            enter_tapped: false,
+            enter_transformed: false,
+            under_your_control: false,
+            enters_attacking: false,
+            owner_library: false,
+        };
+
+        let result = apply_as_current(&mut state, GameAction::SelectCards { cards: vec![] });
+
+        assert!(result.is_err());
+        assert!(state.battlefield.contains(&obj_id));
     }
 
     #[test]
@@ -11570,6 +11607,7 @@ mod phase_trigger_regression_tests {
                     TypedFilter::creature().controller(ControllerRef::ScopedPlayer),
                 ),
                 count: QuantityExpr::Fixed { value: 1 },
+                min_count: 0,
             },
         );
         let ability = ResolvedAbility::new(
@@ -11614,6 +11652,7 @@ mod phase_trigger_regression_tests {
                     TypedFilter::creature().controller(ControllerRef::ScopedPlayer),
                 ),
                 count: QuantityExpr::Fixed { value: 1 },
+                min_count: 0,
             },
         );
         let token_branch = AbilityDefinition::new(
@@ -11711,6 +11750,7 @@ mod phase_trigger_regression_tests {
             Effect::Sacrifice {
                 target: TargetFilter::Typed(TypedFilter::creature().controller(ControllerRef::You)),
                 count: QuantityExpr::Fixed { value: 1 },
+                min_count: 0,
             },
             vec![],
             source_id,

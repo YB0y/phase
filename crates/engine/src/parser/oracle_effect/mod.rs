@@ -4449,7 +4449,14 @@ fn try_parse_verb_and_target<'a>(
         ));
         let (target_text, _) = strip_optional_target_prefix(after_count.trim_start());
         let (target, rem) = parse_target_with_ctx(target_text, ctx);
-        return Some((TargetedImperativeAst::Sacrifice { target, count }, rem));
+        return Some((
+            TargetedImperativeAst::Sacrifice {
+                target,
+                count,
+                min_count: 0,
+            },
+            rem,
+        ));
     }
     if let Some((_, rest)) = nom_on_lower(text, lower, |i| value((), tag("fight ")).parse(i)) {
         let (target_text, _) = strip_optional_target_prefix(rest);
@@ -6254,7 +6261,7 @@ fn inject_subject_target(effect: &mut Effect, subject: &SubjectPhraseAst) {
         // reads the chosen player from ability.targets at resolution time.
         // Also rewrite "they control" refs inside the count expression so
         // the dynamic count resolves against the targeted player's board.
-        Effect::Sacrifice { target, count }
+        Effect::Sacrifice { target, count, .. }
             if player_filter_as_controller_ref(&subject_filter).is_some() =>
         {
             if let Some(ctrl) = player_filter_as_controller_ref(&subject_filter) {

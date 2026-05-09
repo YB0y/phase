@@ -878,6 +878,7 @@ fn parse_flash_cleanup_sacrifice_casting_option(
         Effect::Sacrifice {
             target: TargetFilter::SelfRef,
             count: QuantityExpr::Fixed { value: 1 },
+            min_count: 0,
         },
     );
     let delayed = AbilityDefinition::new(
@@ -9889,7 +9890,7 @@ mod tests {
         // as count, and the same Typed filter lifted into target.
         let sacrifice = discard.sub_ability.as_ref().expect("sacrifice sub_ability");
         match &*sacrifice.effect {
-            Effect::Sacrifice { target, count } => {
+            Effect::Sacrifice { target, count, .. } => {
                 assert!(!count.is_up_to(), "expected non-UpTo sacrifice count");
                 match count {
                     QuantityExpr::DivideRounded {

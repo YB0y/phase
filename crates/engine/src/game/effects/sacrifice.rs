@@ -96,12 +96,16 @@ pub fn resolve(
     // `QuantityExpr` (Fixed/Ref/DivideRounded/...) means a mandatory count;
     // wrapped in `UpTo` means the player may select 0..=count.
     let default_count = QuantityExpr::Fixed { value: 1 };
-    let (filter, count_expr, up_to) = match &ability.effect {
-        Effect::Sacrifice { target, count } => {
+    let (filter, count_expr, up_to, min_count) = match &ability.effect {
+        Effect::Sacrifice {
+            target,
+            count,
+            min_count,
+        } => {
             let (inner, up_to) = count.peel_up_to();
-            (target, inner, up_to)
+            (target, inner, up_to, *min_count)
         }
-        _ => (&TargetFilter::Any, &default_count, false),
+        _ => (&TargetFilter::Any, &default_count, false, 0),
     };
     let scoped_ability;
     let ability = if matches!(
@@ -223,6 +227,7 @@ pub fn resolve(
             player: chooser,
             cards: eligible,
             count: choice_count,
+            min_count: min_count.min(choice_count),
             up_to,
             source_id: ability.source_id,
             effect_kind: EffectKind::Sacrifice,
@@ -302,6 +307,7 @@ mod tests {
             Effect::Sacrifice {
                 target: TargetFilter::Any,
                 count: QuantityExpr::Fixed { value: 1 },
+                min_count: 0,
             },
             vec![TargetRef::Object(target)],
             ObjectId(100),
@@ -319,6 +325,7 @@ mod tests {
             Effect::Sacrifice {
                 target: TargetFilter::Any,
                 count,
+                min_count: 0,
             },
             vec![],
             ObjectId(100),
@@ -453,6 +460,7 @@ mod tests {
             Effect::Sacrifice {
                 target: TargetFilter::Typed(typed),
                 count: QuantityExpr::Fixed { value: 1 },
+                min_count: 0,
             },
             targets,
             ObjectId(100),
@@ -589,6 +597,7 @@ mod tests {
                         .controller(ControllerRef::ParentTargetController),
                 ),
                 count: QuantityExpr::Fixed { value: 1 },
+                min_count: 0,
             },
             vec![TargetRef::Object(parent)],
             ObjectId(100),

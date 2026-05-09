@@ -1021,6 +1021,7 @@ pub(super) fn handle_resolution_choice(
                 player,
                 cards,
                 count,
+                min_count,
                 up_to,
                 source_id,
                 effect_kind,
@@ -1035,6 +1036,13 @@ pub(super) fn handle_resolution_choice(
             GameAction::SelectCards { cards: chosen },
         ) => {
             if up_to {
+                if chosen.len() < min_count {
+                    return Err(EngineError::InvalidAction(format!(
+                        "Must select at least {} card(s), got {}",
+                        min_count,
+                        chosen.len()
+                    )));
+                }
                 if chosen.len() > count {
                     return Err(EngineError::InvalidAction(format!(
                         "Must select at most {} card(s), got {}",

@@ -483,9 +483,14 @@ impl TargetedImperativeAst {
     /// fields that represent "N objects/cards" are rewritten.
     pub(crate) fn with_for_each_quantity(self, quantity: QuantityExpr) -> Self {
         match self {
-            Self::Sacrifice { target, count } => Self::Sacrifice {
+            Self::Sacrifice {
+                target,
+                count,
+                min_count,
+            } => Self::Sacrifice {
                 target,
                 count: replace_fixed_quantity(count, quantity),
+                min_count,
             },
             Self::Discard {
                 count,
@@ -526,6 +531,9 @@ pub(crate) enum TargetedImperativeAst {
         /// case; "sacrifice N X" / "sacrifice half the permanents they
         /// control" carry the parsed dynamic count.
         count: QuantityExpr,
+        /// Minimum number of permanents the player must choose when `count` is
+        /// an up-to/ranged quantity. Used for "one or more" choices.
+        min_count: usize,
     },
     Discard {
         count: QuantityExpr,
