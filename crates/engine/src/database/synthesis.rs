@@ -3301,6 +3301,434 @@ mod fabricate_runtime_tests {
 }
 
 #[cfg(test)]
+mod undying_persist_synthesis_tests {
+    //! CR 702.93a + CR 702.79a: Shape tests for the synthesized dies-triggers
+    //! that return a permanent with a counter, gated on its LKI counter state.
+    //! Pinned to the exact wire-up the runtime resolver consumes:
+    //! `TriggerMode::ChangesZone` (Battlefield → Graveyard), `valid_card =
+    //! SelfRef`, `condition = Not(HadCounters(...))`, execute body
+    //! `Effect::ChangeZone` (Graveyard → Battlefield) with
+    //! `enter_with_counters = [(polarity, 1)]`.
+    use super::*;
+
+    fn face_with_keyword(kw: Keyword) -> CardFace {
+        let mut face = CardFace::default();
+        face.keywords.push(kw);
+        face
+    }
+
+    /// CR 702.93a: Undying synthesizes a dies-trigger that returns the
+    /// permanent with one +1/+1 counter, gated on the LKI absence of any
+    /// +1/+1 counter.
+    #[test]
+    fn synthesize_undying_adds_dies_trigger_with_p1p1_return() {
+        let mut face = face_with_keyword(Keyword::Undying);
+        synthesize_undying(&mut face);
+
+        let trigger = face
+            .triggers
+            .iter()
+            .find(|t| is_dies_return_with_counter_trigger(t, "P1P1"))
+            .expect("undying should synthesize a dies-return trigger");
+
+        // Trigger shape: dies (battlefield → graveyard) with self-ref filter.
+        assert!(matches!(trigger.mode, TriggerMode::ChangesZone));
+        assert_eq!(trigger.origin, Some(Zone::Battlefield));
+        assert_eq!(trigger.destination, Some(Zone::Graveyard));
+        assert!(matches!(trigger.valid_card, Some(TargetFilter::SelfRef)));
+
+        // Condition: Not(HadCounters { Some("P1P1") }) — LKI-gated absence.
+        let Some(TriggerCondition::Not { condition }) = &trigger.condition else {
+            panic!("undying condition should be Not(...)");
+        };
+        let TriggerCondition::HadCounters { counter_type } = condition.as_ref() else {
+            panic!("undying inner condition should be HadCounters");
+        };
+        assert_eq!(counter_type.as_deref(), Some("P1P1"));
+
+        // Execute: ChangeZone graveyard → battlefield + one P1P1 counter.
+        let execute = trigger.execute.as_deref().expect("execute body required");
+        let Effect::ChangeZone {
+            origin,
+            destination,
+            target,
+            under_your_control,
+            enter_with_counters,
+            ..
+        } = &*execute.effect
+        else {
+            panic!("undying execute should be Effect::ChangeZone");
+        };
+        assert_eq!(*origin, Some(Zone::Graveyard));
+        assert_eq!(*destination, Zone::Battlefield);
+        assert!(matches!(target, TargetFilter::SelfRef));
+        // CR 702.93a: "under its owner's control" — default routing (no
+        // override) places the object under its owner.
+        assert!(!*under_your_control);
+        assert_eq!(enter_with_counters.len(), 1);
+        let (ct, qty) = &enter_with_counters[0];
+        assert_eq!(ct, "P1P1");
+        assert!(matches!(qty, QuantityExpr::Fixed { value: 1 }));
+    }
+
+    /// CR 702.79a: Persist mirror of the Undying shape test — -1/-1 counters,
+    /// same trigger/effect topology.
+    #[test]
+    fn synthesize_persist_adds_dies_trigger_with_m1m1_return() {
+        let mut face = face_with_keyword(Keyword::Persist);
+        synthesize_persist(&mut face);
+
+        let trigger = face
+            .triggers
+            .iter()
+            .find(|t| is_dies_return_with_counter_trigger(t, "M1M1"))
+            .expect("persist should synthesize a dies-return trigger");
+
+        let Some(TriggerCondition::Not { condition }) = &trigger.condition else {
+            panic!("persist condition should be Not(...)");
+        };
+        let TriggerCondition::HadCounters { counter_type } = condition.as_ref() else {
+            panic!("persist inner condition should be HadCounters");
+        };
+        assert_eq!(counter_type.as_deref(), Some("M1M1"));
+
+        let execute = trigger.execute.as_deref().expect("execute body required");
+        let Effect::ChangeZone {
+            enter_with_counters,
+            ..
+        } = &*execute.effect
+        else {
+            panic!("persist execute should be Effect::ChangeZone");
+        };
+        let (ct, qty) = &enter_with_counters[0];
+        assert_eq!(ct, "M1M1");
+        assert!(matches!(qty, QuantityExpr::Fixed { value: 1 }));
+    }
+
+    /// Repeated synthesis must not duplicate the trigger — the idempotency
+    /// guard counts existing matching-shape triggers and skips when the
+    /// keyword count is already satisfied.
+    #[test]
+    fn synthesize_undying_is_idempotent() {
+        let mut face = face_with_keyword(Keyword::Undying);
+        synthesize_undying(&mut face);
+        synthesize_undying(&mut face);
+        let count = face
+            .triggers
+            .iter()
+            .filter(|t| is_dies_return_with_counter_trigger(t, "P1P1"))
+            .count();
+        assert_eq!(count, 1, "undying trigger should be deduped");
+    }
+
+    #[test]
+    fn synthesize_persist_is_idempotent() {
+        let mut face = face_with_keyword(Keyword::Persist);
+        synthesize_persist(&mut face);
+        synthesize_persist(&mut face);
+        let count = face
+            .triggers
+            .iter()
+            .filter(|t| is_dies_return_with_counter_trigger(t, "M1M1"))
+            .count();
+        assert_eq!(count, 1, "persist trigger should be deduped");
+    }
+
+    /// Faces without the keyword get no synthesized trigger.
+    #[test]
+    fn synthesize_undying_noop_without_keyword() {
+        let mut face = face_with_keyword(Keyword::Flying);
+        synthesize_undying(&mut face);
+        assert!(face.triggers.is_empty());
+    }
+
+    #[test]
+    fn synthesize_persist_noop_without_keyword() {
+        let mut face = face_with_keyword(Keyword::Trample);
+        synthesize_persist(&mut face);
+        assert!(face.triggers.is_empty());
+    }
+
+    /// CR 702.93b: Multiple instances of Undying trigger separately.
+    /// No printed card today has multiple Undying keywords; the test pins
+    /// the rule shape so a future printing routes correctly.
+    #[test]
+    fn synthesize_undying_emits_one_trigger_per_instance() {
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Undying);
+        face.keywords.push(Keyword::Undying);
+        synthesize_undying(&mut face);
+        let count = face
+            .triggers
+            .iter()
+            .filter(|t| is_dies_return_with_counter_trigger(t, "P1P1"))
+            .count();
+        assert_eq!(count, 2);
+    }
+
+    /// A face that carries both Undying and Persist (no printed card today)
+    /// synthesizes two distinct triggers — one per polarity. The shared
+    /// `is_dies_return_with_counter_trigger` predicate is keyed on counter
+    /// type so the Persist trigger doesn't dedupe the Undying trigger.
+    #[test]
+    fn synthesize_undying_and_persist_coexist_with_distinct_triggers() {
+        let mut face = CardFace::default();
+        face.keywords.push(Keyword::Undying);
+        face.keywords.push(Keyword::Persist);
+        synthesize_undying(&mut face);
+        synthesize_persist(&mut face);
+
+        let p1p1 = face
+            .triggers
+            .iter()
+            .filter(|t| is_dies_return_with_counter_trigger(t, "P1P1"))
+            .count();
+        let m1m1 = face
+            .triggers
+            .iter()
+            .filter(|t| is_dies_return_with_counter_trigger(t, "M1M1"))
+            .count();
+        assert_eq!(p1p1, 1, "exactly one Undying trigger");
+        assert_eq!(m1m1, 1, "exactly one Persist trigger");
+    }
+}
+
+#[cfg(test)]
+mod undying_persist_runtime_tests {
+    //! CR 702.93a + CR 702.79a runtime integration: a battlefield permanent
+    //! with the keyword dies, `apply_zone_exit_cleanup` captures its LKI
+    //! counter map into `state.lki_cache`, `process_triggers` fires the
+    //! synthesized dies-trigger, the intervening `Not(HadCounters)` condition
+    //! reads the LKI snapshot, and `resolve_top` resolves `Effect::ChangeZone`
+    //! to return the permanent with a single +1/+1 (or -1/-1) counter.
+
+    use super::*;
+    use crate::game::printed_cards::apply_card_face_to_object;
+    use crate::game::triggers::process_triggers;
+    use crate::game::zones::{create_object, move_to_zone};
+    use crate::types::card_type::CoreType;
+    use crate::types::counter::CounterType;
+    use crate::types::events::GameEvent;
+    use crate::types::game_state::{GameState, StackEntryKind, WaitingFor};
+    use crate::types::identifiers::{CardId, ObjectId};
+    use crate::types::player::PlayerId;
+
+    /// Build a creature face with the given keyword and run the full
+    /// synthesis pipeline to install the dies-trigger.
+    fn creature_face_with_keyword(name: &str, kw: Keyword) -> CardFace {
+        let mut face = CardFace {
+            name: name.to_string(),
+            power: Some(PtValue::Fixed(2)),
+            toughness: Some(PtValue::Fixed(1)),
+            keywords: vec![kw],
+            ..CardFace::default()
+        };
+        face.card_type.core_types.push(CoreType::Creature);
+        synthesize_all(&mut face);
+        face
+    }
+
+    /// Stand up a two-player state with `face` on the battlefield under
+    /// `controller`. Returns the state and the spawned object id so callers
+    /// can mutate counters before killing the creature.
+    fn setup_with_creature(face: &CardFace, controller: PlayerId) -> (GameState, ObjectId) {
+        let mut state = GameState::new_two_player(42);
+        state.turn_number = 2;
+        state.phase = crate::types::phase::Phase::PreCombatMain;
+        state.active_player = controller;
+        state.priority_player = controller;
+        state.waiting_for = WaitingFor::Priority { player: controller };
+
+        let next_card = CardId(state.next_object_id);
+        let obj_id = create_object(
+            &mut state,
+            next_card,
+            controller,
+            face.name.clone(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&obj_id).unwrap();
+            apply_card_face_to_object(obj, face);
+        }
+        (state, obj_id)
+    }
+
+    /// Kill the permanent (battlefield → graveyard), fire its dies-trigger,
+    /// then resolve the top of the stack. Returns the events the chain
+    /// produced so callers can inspect the return-to-battlefield event.
+    fn kill_and_resolve(state: &mut GameState, obj_id: ObjectId) -> Vec<GameEvent> {
+        let mut events = Vec::new();
+        // CR 603.10a: `move_to_zone` captures LKI in `apply_zone_exit_cleanup`
+        // before the object physically leaves the battlefield and emits the
+        // `ZoneChanged` event that `process_triggers` consumes.
+        move_to_zone(state, obj_id, Zone::Graveyard, &mut events);
+        process_triggers(state, &events);
+        let mut resolve_events = Vec::new();
+        if !state.stack.is_empty() {
+            crate::game::stack::resolve_top(state, &mut resolve_events);
+        }
+        resolve_events
+    }
+
+    /// CR 702.93a happy path: a creature with Undying that dies with zero
+    /// +1/+1 counters returns to the battlefield with one +1/+1 counter.
+    #[test]
+    fn undying_returns_with_counter_when_died_with_zero_p1p1_counters() {
+        let face = creature_face_with_keyword("Young Wolf", Keyword::Undying);
+        let (mut state, obj_id) = setup_with_creature(&face, PlayerId(0));
+
+        let _ = kill_and_resolve(&mut state, obj_id);
+
+        let obj = state.objects.get(&obj_id).expect("object still tracked");
+        assert_eq!(
+            obj.zone,
+            Zone::Battlefield,
+            "undying should return the permanent to the battlefield"
+        );
+        assert_eq!(obj.owner, PlayerId(0));
+        // CR 702.93a: "under its owner's control"
+        assert_eq!(obj.controller, PlayerId(0));
+        let p1p1: u32 = obj
+            .counters
+            .iter()
+            .filter(|(ct, _)| **ct == CounterType::Plus1Plus1)
+            .map(|(_, n)| *n)
+            .sum();
+        assert_eq!(p1p1, 1, "undying returns with exactly one +1/+1 counter");
+    }
+
+    /// CR 702.93a negative path: a creature with Undying that died WITH a
+    /// +1/+1 counter must NOT return. The intervening `Not(HadCounters)`
+    /// condition gates the trigger out at the check phase, so the stack
+    /// never has a triggered ability for the return.
+    #[test]
+    fn undying_does_not_return_when_died_with_one_p1p1_counter() {
+        let face = creature_face_with_keyword("Strangleroot Geist", Keyword::Undying);
+        let (mut state, obj_id) = setup_with_creature(&face, PlayerId(0));
+
+        // Seed a +1/+1 counter on the live creature so the LKI snapshot
+        // (captured at `move_to_zone` entry) shows the counter.
+        state
+            .objects
+            .get_mut(&obj_id)
+            .unwrap()
+            .counters
+            .insert(CounterType::Plus1Plus1, 1);
+
+        let _ = kill_and_resolve(&mut state, obj_id);
+
+        let obj = state.objects.get(&obj_id).expect("object still tracked");
+        assert_eq!(
+            obj.zone,
+            Zone::Graveyard,
+            "undying must NOT return a creature that died with a +1/+1 counter"
+        );
+        assert!(
+            !state
+                .stack
+                .iter()
+                .any(|e| matches!(e.kind, StackEntryKind::TriggeredAbility { .. })),
+            "no surviving trigger on the stack — the intervening-if filtered it"
+        );
+    }
+
+    /// CR 702.79a happy path: Persist returns the permanent with one -1/-1
+    /// counter if it died with no -1/-1 counter.
+    #[test]
+    fn persist_returns_with_counter_when_died_with_zero_m1m1_counters() {
+        let face = creature_face_with_keyword("Kitchen Finks", Keyword::Persist);
+        let (mut state, obj_id) = setup_with_creature(&face, PlayerId(0));
+
+        let _ = kill_and_resolve(&mut state, obj_id);
+
+        let obj = state.objects.get(&obj_id).expect("object still tracked");
+        assert_eq!(obj.zone, Zone::Battlefield);
+        let m1m1: u32 = obj
+            .counters
+            .iter()
+            .filter(|(ct, _)| **ct == CounterType::Minus1Minus1)
+            .map(|(_, n)| *n)
+            .sum();
+        assert_eq!(m1m1, 1, "persist returns with exactly one -1/-1 counter");
+    }
+
+    /// CR 702.79a negative path: Persist creature that died with a -1/-1
+    /// counter must NOT return.
+    #[test]
+    fn persist_does_not_return_when_died_with_one_m1m1_counter() {
+        let face = creature_face_with_keyword("Murderous Redcap", Keyword::Persist);
+        let (mut state, obj_id) = setup_with_creature(&face, PlayerId(0));
+
+        state
+            .objects
+            .get_mut(&obj_id)
+            .unwrap()
+            .counters
+            .insert(CounterType::Minus1Minus1, 1);
+
+        let _ = kill_and_resolve(&mut state, obj_id);
+
+        let obj = state.objects.get(&obj_id).expect("object still tracked");
+        assert_eq!(
+            obj.zone,
+            Zone::Graveyard,
+            "persist must NOT return a creature that died with a -1/-1 counter"
+        );
+    }
+
+    /// CR 603 multi-trigger semantics: a permanent that carries BOTH Undying
+    /// and Persist (a contrived dual-keyword card) puts both triggers on the
+    /// stack on death. The first to resolve returns the permanent to the
+    /// battlefield. The second-to-resolve finds the (new-object) source no
+    /// longer in the graveyard, so its self-ref `Effect::ChangeZone` is a
+    /// no-op — the permanent is NOT double-returned. The post-condition
+    /// here is simply that the permanent ends up on the battlefield exactly
+    /// once after both triggers process.
+    #[test]
+    fn undying_and_persist_together_on_same_face_does_not_double_return() {
+        let mut face = CardFace {
+            name: "Test Dual".to_string(),
+            power: Some(PtValue::Fixed(2)),
+            toughness: Some(PtValue::Fixed(1)),
+            keywords: vec![Keyword::Undying, Keyword::Persist],
+            ..CardFace::default()
+        };
+        face.card_type.core_types.push(CoreType::Creature);
+        synthesize_all(&mut face);
+
+        let (mut state, obj_id) = setup_with_creature(&face, PlayerId(0));
+
+        // Die with zero counters — both Undying and Persist conditions
+        // evaluate true at trigger-condition check.
+        let mut events = Vec::new();
+        move_to_zone(&mut state, obj_id, Zone::Graveyard, &mut events);
+        process_triggers(&mut state, &events);
+
+        // Drain the entire stack.
+        while !state.stack.is_empty() {
+            let mut resolve_events = Vec::new();
+            crate::game::stack::resolve_top(&mut state, &mut resolve_events);
+        }
+
+        let obj = state.objects.get(&obj_id).expect("object still tracked");
+        // The permanent is on the battlefield exactly once (single object id,
+        // single zone). The total counter count varies depending on stack
+        // ordering — but the count of physical objects with this id is one.
+        assert_eq!(obj.zone, Zone::Battlefield);
+        let count_in_battlefield = state
+            .objects
+            .values()
+            .filter(|o| o.zone == Zone::Battlefield && o.name == "Test Dual")
+            .count();
+        assert_eq!(
+            count_in_battlefield, 1,
+            "dual-keyword permanent must not be double-returned"
+        );
+    }
+}
+
+#[cfg(test)]
 mod echo_synthesis_tests {
     use super::*;
     use crate::types::mana::{ManaCost, ManaCostShard};
