@@ -402,6 +402,30 @@ pub(super) fn handle_copy_target_choice(
     }
     apply_etb_counters(state, source_id, &enter_modifiers.counters, events);
     state.layers_dirty = true;
+    // CR 614.12a + CR 707.9: The battlefield-entry `ZoneChanged` event was
+    // captured into `state.deferred_entry_events` when `CopyTargetChoice` was
+    // set up, *before* `BecomeCopy` had a chance to push the copied object's
+    // characteristics and any `GrantTrigger` continuous modifications (e.g.
+    // Callidus Assassin's "destroy another creature with the same name")
+    // into `trigger_definitions`. With the copy now resolved and layers
+    // re-evaluated, replay those events through the same trigger pipeline
+    // the pipeline would have run for them (`process_triggers` for CR 603.2
+    // event-based triggers + `check_delayed_triggers` for CR 603.7c delayed
+    // triggers) so granted ETBs and observer ETBs (Soul Warden) match
+    // against the realized copy. Replay is gated on the source still being
+    // on the battlefield — concede / error / chained-replacement paths can
+    // leave a stale event in the vec, and we discard rather than fire a
+    // phantom entry trigger.
+    let deferred = std::mem::take(&mut state.deferred_entry_events);
+    let source_still_on_battlefield = state
+        .objects
+        .get(&source_id)
+        .is_some_and(|obj| obj.zone == Zone::Battlefield);
+    if !deferred.is_empty() && source_still_on_battlefield {
+        super::triggers::process_triggers(state, &deferred);
+        let delayed_events = super::triggers::check_delayed_triggers(state, &deferred);
+        events.extend(delayed_events);
+    }
     effects::drain_pending_continuation(state, events);
     Ok(WaitingFor::Priority {
         player: state.active_player,

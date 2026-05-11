@@ -12395,6 +12395,149 @@ mod phase_trigger_regression_tests {
         assert_eq!(copied.toughness, Some(5));
     }
 
+    /// CR 614.12a + CR 707.9: Callidus Assassin grants its copy a "When this
+    /// creature enters" trigger as part of the entering-as-copy bundle. The
+    /// ETB event for the copy must fire *after* the player chooses a target
+    /// for the copy effect and `BecomeCopy` has stamped the granted trigger
+    /// onto `trigger_definitions` — otherwise the trigger silently never
+    /// fires. Regression for: the deferred-trigger replay path in
+    /// `engine_priority::run_post_action_pipeline` +
+    /// `engine_replacement::handle_copy_target_choice`.
+    #[test]
+    fn copy_target_choice_fires_granted_etb_trigger_against_deferred_entry_event() {
+        use crate::types::ability::{
+            AbilityDefinition, AbilityKind, ContinuousModification, QuantityExpr, TriggerDefinition,
+        };
+        use crate::types::triggers::TriggerMode;
+
+        let mut state = GameState::new_two_player(42);
+
+        let bear = zones::create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Bear".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&bear).unwrap();
+            obj.base_power = Some(2);
+            obj.base_toughness = Some(2);
+            obj.power = Some(2);
+            obj.toughness = Some(2);
+        }
+
+        // Granted trigger: "When this creature enters, controller draws a card."
+        // Targetless to keep the test focused on the deferral mechanism rather
+        // than target-selection plumbing.
+        let granted = TriggerDefinition::new(TriggerMode::ChangesZone)
+            .execute(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+            ))
+            .valid_card(TargetFilter::SelfRef)
+            .destination(Zone::Battlefield);
+
+        let assassin = zones::create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Callidus Assassin".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&assassin).unwrap();
+            obj.base_power = Some(3);
+            obj.base_toughness = Some(3);
+            obj.power = Some(3);
+            obj.toughness = Some(3);
+            obj.replacement_definitions.push(
+                crate::types::ability::ReplacementDefinition::new(
+                    crate::types::replacements::ReplacementEvent::Moved,
+                )
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::BecomeCopy {
+                        target: TargetFilter::Typed(crate::types::ability::TypedFilter::new(
+                            crate::types::ability::TypeFilter::Creature,
+                        )),
+                        duration: None,
+                        mana_value_limit: None,
+                        additional_modifications: vec![ContinuousModification::GrantTrigger {
+                            trigger: Box::new(granted.clone()),
+                        }],
+                    },
+                )),
+            );
+        }
+
+        // Capture a real `ZoneChanged` for Callidus by bouncing it through
+        // stack→battlefield once. We then put it in the deferred queue to
+        // model what the post-action pipeline does at the moment
+        // `CopyTargetChoice` is set up.
+        {
+            let mut warmup_events: Vec<GameEvent> = Vec::new();
+            zones::move_to_zone(&mut state, assassin, Zone::Stack, &mut warmup_events);
+            warmup_events.clear();
+            zones::move_to_zone(&mut state, assassin, Zone::Battlefield, &mut warmup_events);
+            let entry_event = warmup_events
+                .into_iter()
+                .find(|e| {
+                    matches!(
+                        e,
+                        GameEvent::ZoneChanged { object_id, to, .. }
+                            if *object_id == assassin && *to == Zone::Battlefield
+                    )
+                })
+                .expect("move_to_zone must emit a ZoneChanged for the entry");
+            state.deferred_entry_events.push(entry_event);
+        }
+        state.waiting_for = WaitingFor::CopyTargetChoice {
+            player: PlayerId(0),
+            source_id: assassin,
+            valid_targets: vec![bear],
+            max_mana_value: None,
+        };
+
+        apply_as_current(
+            &mut state,
+            GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(bear)),
+            },
+        )
+        .expect("copy target choice should resolve");
+
+        // After the copy resolves and layers re-evaluate, the granted trigger
+        // must be on the copy's trigger_definitions...
+        let copied = state.objects.get(&assassin).unwrap();
+        assert!(
+            copied.trigger_definitions.iter_all().any(|t| t == &granted),
+            "BecomeCopy's GrantTrigger modification must be present on the copy"
+        );
+
+        // ...and the deferred entry event must have been replayed through
+        // process_triggers, so the granted ETB matched and queued.
+        assert!(
+            state.deferred_entry_events.is_empty(),
+            "deferred entry events must be drained after copy choice resolves"
+        );
+        let trigger_fired = state.pending_trigger.is_some()
+            || state.stack.iter().any(|entry| {
+                matches!(
+                    entry.kind,
+                    crate::types::game_state::StackEntryKind::TriggeredAbility { source_id, .. }
+                        if source_id == assassin
+                )
+            });
+        assert!(
+            trigger_fired,
+            "granted ETB trigger must fire from the deferred entry event"
+        );
+    }
+
     #[test]
     fn copy_target_choice_rejects_invalid_target() {
         let mut state = GameState::new_two_player(42);

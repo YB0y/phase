@@ -17,6 +17,16 @@ pub(super) fn run_post_action_pipeline(
     // whether new triggered abilities were added during this pipeline pass.
     let stack_before = state.stack.len();
 
+    // CR 614.12a + CR 707.9: If the resolving event left the engine waiting on
+    // a mid-entry choice (currently `CopyTargetChoice`), the entering object's
+    // characteristics and granted triggers aren't finalized yet — trigger
+    // scanning of its battlefield-entry event must wait until the choice
+    // resolves and layers re-evaluate. Clone matching events into
+    // `state.deferred_entry_events` (the `events` vec itself is preserved so
+    // the frontend still sees the entry); `handle_copy_target_choice` replays
+    // them through `process_triggers` after `BecomeCopy` resolves.
+    let mid_entry_source = capture_mid_entry_deferred_events(state, events);
+
     // CR 603.2: Triggered abilities trigger at the moment the event occurs.
     // Scan for triggers BEFORE SBAs so that objects still on the battlefield
     // (e.g., a creature that just took lethal damage) are found by the scan.
@@ -25,6 +35,7 @@ pub(super) fn run_post_action_pipeline(
         let filtered_events: Vec<_> = events
             .iter()
             .filter(|event| !matches!(event, GameEvent::PhaseChanged { .. }))
+            .filter(|event| !is_deferred_entry_event(mid_entry_source, event))
             .cloned()
             .collect();
         triggers::process_triggers(state, &filtered_events);
@@ -119,6 +130,55 @@ fn flush_pending_miracle_offer(state: &mut GameState, outgoing: WaitingFor) -> W
         },
         None => outgoing,
     }
+}
+
+/// CR 614.12a + CR 707.9: If the post-action waiting state is a mid-entry
+/// player choice (`CopyTargetChoice`), clone the entering object's
+/// battlefield-entry `ZoneChanged` event into `state.deferred_entry_events`
+/// and return the source id so `process_triggers` can filter it out. The
+/// `events` vec itself is preserved so the frontend animates the entry as
+/// soon as the spell resolves. `handle_copy_target_choice` drains
+/// `deferred_entry_events` and replays them through `process_triggers` after
+/// `BecomeCopy` resolves + layers re-evaluate, so granted ETBs (Callidus
+/// Assassin's destroy-same-name) and observer ETBs (Soul Warden) both
+/// match against the fully-realized copy.
+fn capture_mid_entry_deferred_events(
+    state: &mut GameState,
+    events: &[GameEvent],
+) -> Option<crate::types::identifiers::ObjectId> {
+    let WaitingFor::CopyTargetChoice { source_id, .. } = state.waiting_for else {
+        return None;
+    };
+    // Defense in depth: a prior `CopyTargetChoice` that exited abnormally
+    // (concede mid-choice, eliminate_player, error return before drain) may
+    // have left stale events for an unrelated source. Reset before capturing
+    // the new entry's events so the replay in `handle_copy_target_choice`
+    // never fires triggers against a phantom object.
+    state.deferred_entry_events.clear();
+    for event in events {
+        if is_battlefield_entry_for(source_id, event) {
+            state.deferred_entry_events.push(event.clone());
+        }
+    }
+    Some(source_id)
+}
+
+fn is_deferred_entry_event(
+    source: Option<crate::types::identifiers::ObjectId>,
+    event: &GameEvent,
+) -> bool {
+    source.is_some_and(|src| is_battlefield_entry_for(src, event))
+}
+
+fn is_battlefield_entry_for(
+    source: crate::types::identifiers::ObjectId,
+    event: &GameEvent,
+) -> bool {
+    matches!(
+        event,
+        GameEvent::ZoneChanged { object_id, to, .. }
+            if *object_id == source && *to == crate::types::zones::Zone::Battlefield
+    )
 }
 
 /// Pop the next `MiracleOffer` whose `object_id` is still in the player's

@@ -2755,6 +2755,20 @@ pub struct GameState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_spell_resolution: Option<PendingSpellResolution>,
 
+    /// CR 614.12a + CR 707.9 + CR 603.2: `ZoneChanged`-to-battlefield events
+    /// for an object whose entry is paused mid-resolution awaiting an
+    /// interactive choice (e.g. `WaitingFor::CopyTargetChoice`). Per CR
+    /// 614.12a, effects that modify how a permanent enters function
+    /// continuously *while it is entering* — so the entry isn't finalized
+    /// (and trigger scanning can't run) until the choice resolves. The
+    /// post-action pipeline moves matching events here before
+    /// `process_triggers`, and `handle_copy_target_choice` replays them
+    /// after `BecomeCopy` resolves + layers re-evaluate so granted ETBs
+    /// (Callidus Assassin's destroy-same-name) and observer ETBs
+    /// (Soul Warden) match against the fully-realized copy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred_entry_events: Vec<GameEvent>,
+
     // Layer system
     pub layers_dirty: bool,
     pub next_timestamp: u64,
@@ -3492,6 +3506,7 @@ impl GameState {
             post_replacement_event_source: None,
             post_replacement_event_target: None,
             pending_spell_resolution: None,
+            deferred_entry_events: Vec::new(),
             layers_dirty: true,
             next_timestamp: 1,
             public_state_dirty: PublicStateDirty::all_dirty(),
@@ -3736,6 +3751,7 @@ impl PartialEq for GameState {
             && self.priority_pass_count == other.priority_pass_count
             && self.pending_replacement == other.pending_replacement
             && self.pending_spell_resolution == other.pending_spell_resolution
+            && self.deferred_entry_events == other.deferred_entry_events
             && self.layers_dirty == other.layers_dirty
             && self.next_timestamp == other.next_timestamp
             && self.public_state_dirty == other.public_state_dirty
