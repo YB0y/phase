@@ -52,7 +52,7 @@ pub fn parse_inner_condition(input: &str) -> OracleResult<'_, StaticCondition> {
 fn parse_state_presence_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
     alt((
         parse_turn_conditions,
-        // CR 208.1 + CR 603.4 + CR 107.3e: Superlative-comparison gate
+        // CR 208.1 + CR 603.4 + CR 109.3: Superlative-comparison gate
         // ("if its power is greater than each other creature's power" /
         // "if it has the greatest power among creatures on the battlefield").
         // Must precede `parse_source_state_conditions` so the longer phrase
@@ -747,7 +747,7 @@ fn parse_source_power_toughness_condition(input: &str) -> OracleResult<'_, Stati
     ))
 }
 
-/// CR 208.1 + CR 113.6 + CR 603.4 + CR 109.3 + CR 107.3e:
+/// CR 208.1 + CR 603.4 + CR 109.3:
 /// Parse superlative-comparison conditions of the form
 /// "its <property> is <comparator> each other <type>'s <property>" and the
 /// equivalent surface forms "it has the [greatest|lowest] <property> among
@@ -756,9 +756,10 @@ fn parse_source_power_toughness_condition(input: &str) -> OracleResult<'_, Stati
 /// object (CR 603.4 + CR 109.3), the right-hand side aggregates the same
 /// property across every OTHER object of the filtered class via
 /// `FilterProp::OtherThanTriggerObject` (CR 603.4 + CR 109.3 — see the
-/// `OtherThanTriggerObject` doc), and the comparator selects the matching
-/// aggregate function (CR 107.3e — Max for "greater than"/"greatest"; Min for
-/// "less than"/"lowest"). Used by Selvala, Heart of the Wilds' ETB draw gate.
+/// `OtherThanTriggerObject` doc on `FilterProp`). The comparator-aggregate
+/// pairing (Max for "greater than"/"greatest"; Min for "less than"/"lowest")
+/// is grammatical coupling, not a CR-defined rule. Used by Selvala, Heart of
+/// the Wilds' ETB draw gate.
 ///
 /// Outputs `StaticCondition::QuantityComparison` with:
 /// - LHS `QuantityRef::Power|Toughness|ObjectManaValue { scope:
@@ -778,6 +779,17 @@ fn parse_subject_property_superlative_comparison(input: &str) -> OracleResult<'_
     //   B. "it has the [greatest|lowest] <prop> among <filter>"
     //      (with optional "or is tied for [greatest|lowest] <prop> among
     //      <filter>" extension that relaxes strict > to >=)
+    //
+    // Status: Form A is reached by the trigger intervening-if path
+    // (`extract_if_condition` → `parse_inner_condition`) for Selvala-class
+    // cards. Form B is wired into the same `parse_inner_condition` entry but
+    // is not yet reached by real cards: Strength-Testing Hammer and Wretched
+    // Banquet route through sub-clause/trailing-suffix paths that don't
+    // currently delegate to this combinator. Form B is retained so that the
+    // follow-up routing fix (extending `strip_property_conditional` to accept
+    // aggregate RHS, or routing the "then if" sub-clause body through
+    // `try_nom_condition_as_ability_condition`) lands a one-line change
+    // rather than re-deriving the grammar.
     alt((
         parse_subject_property_inequality_form,
         parse_subject_has_superlative_form,
@@ -883,9 +895,10 @@ fn parse_property_keyword(input: &str) -> OracleResult<'_, ObjectProperty> {
 
 /// Parse the comparator phrase between "is " and "each other ...".
 ///
-/// The aggregate function is coupled to the comparator direction (CR 107.3e):
-/// GT/GE compare against the Max of the population (∃ object with greater
-/// property than each ⟺ subject > Max of others); LT/LE compare against Min.
+/// The aggregate function is coupled to the comparator direction by the
+/// grammar (not a CR rule): GT/GE compare against the Max of the population
+/// (∃ object with greater property than each ⟺ subject > Max of others);
+/// LT/LE compare against Min.
 fn parse_superlative_comparator_phrase(
     input: &str,
 ) -> OracleResult<'_, (Comparator, AggregateFunction)> {
@@ -921,8 +934,8 @@ fn parse_optional_tied_for_tail(
     let strict_comparator = match aggregate {
         AggregateFunction::Max => Comparator::GT,
         AggregateFunction::Min => Comparator::LT,
-        // CR 107.3e: Sum aggregate is not produced by this combinator; default
-        // to GT for completeness.
+        // Sum aggregate is not produced by this combinator; default to GT
+        // for completeness (this arm is dead).
         AggregateFunction::Sum => Comparator::GT,
     };
     // The leading clause may end here (no "or is tied for" tail) — return GT/LT.
@@ -945,8 +958,8 @@ fn parse_optional_tied_for_tail(
             nom::error::ErrorKind::Fail,
         )));
     }
-    // CR 107.3e + CR 113.3: strict-greater + tied = non-strict (>=); same for
-    // less-than + tied = (<=).
+    // Strict-greater + tied = non-strict (>=); same for less-than + tied =
+    // (<=). This is grammatical relaxation, not a CR-defined rule.
     let relaxed = match strict_comparator {
         Comparator::GT => Comparator::GE,
         Comparator::LT => Comparator::LE,
@@ -7614,7 +7627,7 @@ mod tests {
         assert_eq!(unchanged, TargetFilter::Player);
     }
 
-    /// CR 208.1 + CR 603.4 + CR 107.3e: Selvala-class superlative-comparison
+    /// CR 208.1 + CR 603.4 + CR 109.3: Selvala-class superlative-comparison
     /// gate — "its power is greater than each other creature's power" must
     /// emit a `QuantityComparison` whose RHS is an aggregate (Max, Power)
     /// over creatures excluding the triggering object.

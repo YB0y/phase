@@ -5762,8 +5762,8 @@ mod tests {
         assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), obj_id), 5);
     }
 
-    /// CR 603.4 + CR 109.3 + CR 107.3e: The `Aggregate` resolver must exclude
-    /// the triggering object from its population when the filter carries
+    /// CR 603.4 + CR 109.3: The `Aggregate` resolver must exclude the
+    /// triggering object from its population when the filter carries
     /// `FilterProp::OtherThanTriggerObject`. This mirrors the existing
     /// `ObjectCount` exclusion path and supports the Selvala-class
     /// "each other creature's power" superlative comparison.

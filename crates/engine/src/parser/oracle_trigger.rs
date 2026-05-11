@@ -1311,7 +1311,7 @@ fn substitute_another_in_expr(expr: &QuantityExpr) -> QuantityExpr {
                 qualities: qualities.clone(),
             },
         },
-        // CR 107.3e + CR 603.4: Aggregate populations are also "object
+        // CR 603.4 + CR 109.3: Aggregate populations are also "object
         // populations" in the same sense as ObjectCount — when an
         // intervening-if references an aggregate over "each other <type>",
         // the exclusion must be trigger-relative, not source-relative.
@@ -14324,12 +14324,11 @@ mod tests {
         }
     }
 
-    /// CR 208.1 + CR 603.4 + CR 109.3 + CR 107.3e: Selvala, Heart of the
-    /// Wilds — the ETB trigger fires unconditionally for every other creature,
-    /// but the "may draw a card" effect is gated on the triggering creature's
-    /// power being strictly greater than the max power of every other
-    /// creature. Regression for the silently-dropped intervening-if condition
-    /// (#333).
+    /// CR 208.1 + CR 603.4 + CR 109.3: Selvala, Heart of the Wilds — the ETB
+    /// trigger fires unconditionally for every other creature, but the "may
+    /// draw a card" effect is gated on the triggering creature's power being
+    /// strictly greater than the max power of every other creature.
+    /// Regression for the silently-dropped intervening-if condition (#333).
     #[test]
     fn trigger_intervening_if_selvala_power_greater_than_each_other() {
         let def = parse_trigger_line(
