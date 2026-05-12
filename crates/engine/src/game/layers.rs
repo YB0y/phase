@@ -1701,7 +1701,10 @@ fn apply_continuous_effect(state: &mut GameState, effect: &ActiveContinuousEffec
                         .iter()
                         .any(|k| std::mem::discriminant(k) == std::mem::discriminant(&keyword))
                     {
-                        obj.keywords.push(keyword);
+                        obj.keywords.push(keyword.clone());
+                    }
+                    for trigger in KeywordTriggerInstaller::triggers_for(&keyword) {
+                        obj.trigger_definitions.push(trigger);
                     }
                 }
             }
@@ -5999,6 +6002,46 @@ mod tests {
             annihilator_triggers, 2,
             "printed Annihilator 1 and granted Annihilator 1 must remain independent trigger instances"
         );
+    }
+
+    #[test]
+    fn add_dynamic_keyword_annihilator_installs_resolved_attack_trigger() {
+        let mut state = setup();
+        let attacker = make_creature(&mut state, "Dynamic Annihilator", 2, 2, PlayerId(0));
+        let source = make_creature(&mut state, "Variable Battle-Mace", 1, 1, PlayerId(0));
+        let def = StaticDefinition::continuous()
+            .affected(TargetFilter::SpecificObject { id: attacker })
+            .modifications(vec![ContinuousModification::AddDynamicKeyword {
+                kind: crate::types::keywords::DynamicKeywordKind::Annihilator,
+                value: QuantityExpr::Fixed { value: 3 },
+            }]);
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .static_definitions
+            .push(def);
+
+        evaluate_layers(&mut state);
+
+        let obj = state.objects.get(&attacker).unwrap();
+        assert!(obj.keywords.contains(&Keyword::Annihilator(3)));
+        let trigger = obj
+            .trigger_definitions
+            .iter_all()
+            .find(|trigger| {
+                matches!(
+                    trigger.execute.as_deref().map(|ability| &*ability.effect),
+                    Some(Effect::Sacrifice {
+                        target: TargetFilter::Typed(filter),
+                        count: QuantityExpr::Fixed { value: 3 },
+                        ..
+                    }) if filter.controller == Some(ControllerRef::DefendingPlayer)
+                )
+            })
+            .expect("dynamic Annihilator 3 should install a sacrifice trigger");
+        assert!(matches!(trigger.mode, TriggerMode::Attacks));
+        assert!(matches!(trigger.valid_card, Some(TargetFilter::SelfRef)));
     }
 
     /// CR 702.16m: Multiple instances of protection from the same quality on
