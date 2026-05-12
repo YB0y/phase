@@ -3552,54 +3552,89 @@ mod fabricate_runtime_tests {
         }
     }
 
-    /// Place a fabricate-bearing creature on the battlefield, fire the ETB
-    /// event, and resolve the stack down to the choose-one-of branch prompt.
-    fn etb_and_resolve_to_choice(face: &CardFace, controller: PlayerId) -> (GameState, ObjectId) {
+    fn setup_state_with_priority(controller: PlayerId) -> GameState {
         let mut state = GameState::new_two_player(42);
         state.turn_number = 2;
         state.phase = crate::types::phase::Phase::PreCombatMain;
         state.active_player = controller;
         state.priority_player = controller;
         state.waiting_for = WaitingFor::Priority { player: controller };
+        state
+    }
 
+    /// Cast a Fabricate creature from hand, then pass priority through the
+    /// normal stack pipeline until the ETB trigger resolves into the
+    /// ChooseOneOfBranch prompt. This intentionally does not synthesize the
+    /// ZoneChanged event or call process_triggers directly.
+    fn cast_and_resolve_fabricate_to_choice(
+        face: &CardFace,
+        controller: PlayerId,
+    ) -> (GameState, ObjectId) {
+        let mut state = setup_state_with_priority(controller);
         let next_card = CardId(state.next_object_id);
         let obj_id = create_object(
             &mut state,
             next_card,
             controller,
             face.name.clone(),
-            Zone::Battlefield,
+            Zone::Hand,
         );
         {
             let obj = state.objects.get_mut(&obj_id).unwrap();
             apply_card_face_to_object(obj, face);
         }
 
-        // Fabricate's ETB trigger goes onto the stack via process_triggers.
-        process_triggers(&mut state, &[etb_event(obj_id, &face.name)]);
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::CastSpell {
+                object_id: obj_id,
+                card_id: next_card,
+                targets: vec![],
+            },
+        )
+        .unwrap();
 
-        // Stack should have the synthesized triggered ability.
-        assert!(
-            state
+        let mut saw_fabricate_trigger_on_stack = false;
+        for _ in 0..8 {
+            if matches!(state.waiting_for, WaitingFor::ChooseOneOfBranch { .. }) {
+                assert!(
+                    saw_fabricate_trigger_on_stack,
+                    "Fabricate ETB trigger must land on the stack before resolving"
+                );
+                assert_eq!(
+                    state.objects.get(&obj_id).unwrap().zone,
+                    Zone::Battlefield,
+                    "Fabricate creature must enter through stack resolution"
+                );
+                return (state, obj_id);
+            }
+
+            assert!(
+                matches!(state.waiting_for, WaitingFor::Priority { .. }),
+                "expected priority while advancing cast/trigger pipeline, got {:?}",
+                state.waiting_for
+            );
+            saw_fabricate_trigger_on_stack |= state
                 .stack
                 .iter()
-                .any(|entry| matches!(&entry.kind, StackEntryKind::TriggeredAbility { .. })),
-            "Fabricate ETB trigger must land on the stack"
-        );
+                .any(|entry| matches!(&entry.kind, StackEntryKind::TriggeredAbility { .. }));
+            crate::game::engine::apply_as_current(&mut state, GameAction::PassPriority).unwrap();
+        }
 
-        // Drain the stack: resolve top should consume the trigger and
-        // hand off to ChooseOneOfBranch.
-        let mut events = Vec::new();
-        crate::game::stack::resolve_top(&mut state, &mut events);
-        (state, obj_id)
+        panic!(
+            "Fabricate ETB trigger did not resolve to ChooseOneOfBranch; waiting_for={:?}, stack_len={}",
+            state.waiting_for,
+            state.stack.len()
+        );
     }
 
     /// CR 702.123a branch A: choosing the +1/+1 counter branch places N
-    /// P1P1 counters on the entering permanent.
+    /// P1P1 counters on the permanent that entered via normal spell
+    /// resolution.
     #[test]
-    fn fabricate_counter_branch_places_p1p1_counters_on_self() {
+    fn fabricate_e2e_counter_branch_places_p1p1_counters_on_self() {
         let face = fabricate_creature_face("Cultivator of Blades", 2);
-        let (mut state, obj_id) = etb_and_resolve_to_choice(&face, PlayerId(0));
+        let (mut state, obj_id) = cast_and_resolve_fabricate_to_choice(&face, PlayerId(0));
 
         // Confirm the choose-one-of prompt is waiting on the controller.
         assert!(matches!(
@@ -3628,11 +3663,12 @@ mod fabricate_runtime_tests {
     }
 
     /// CR 702.123a branch B: choosing the Servo branch creates N 1/1
-    /// colorless Servo artifact creature tokens under the controller.
+    /// colorless Servo artifact creature tokens under the controller after
+    /// normal spell and ETB-trigger resolution.
     #[test]
-    fn fabricate_servo_branch_creates_artifact_creature_tokens() {
+    fn fabricate_e2e_servo_branch_creates_artifact_creature_tokens() {
         let face = fabricate_creature_face("Cultivator of Blades", 2);
-        let (mut state, _obj_id) = etb_and_resolve_to_choice(&face, PlayerId(0));
+        let (mut state, _obj_id) = cast_and_resolve_fabricate_to_choice(&face, PlayerId(0));
 
         // Branch 1 = Servo tokens.
         crate::game::engine::apply_as_current(&mut state, GameAction::ChooseBranch { index: 1 })
@@ -3672,7 +3708,7 @@ mod fabricate_runtime_tests {
     #[test]
     fn fabricate_one_resolves_with_singleton_payload() {
         let face = fabricate_creature_face("Ambitious Aetherborn", 1);
-        let (mut state, obj_id) = etb_and_resolve_to_choice(&face, PlayerId(0));
+        let (mut state, obj_id) = cast_and_resolve_fabricate_to_choice(&face, PlayerId(0));
 
         crate::game::engine::apply_as_current(&mut state, GameAction::ChooseBranch { index: 0 })
             .unwrap();
@@ -3687,8 +3723,9 @@ mod fabricate_runtime_tests {
         assert_eq!(p1p1_count, 1);
     }
 
-    /// Negative: a non-Fabricate creature ETB must not synthesize a
-    /// ChooseOneOf prompt. Guards against the synthesizer over-firing.
+    /// Lower-level trigger plumbing negative: a non-Fabricate creature ETB
+    /// event must not synthesize a ChooseOneOf prompt. The positive branch
+    /// tests above cover the full cast/priority/stack runtime pipeline.
     #[test]
     fn etb_without_fabricate_does_not_emit_choose_one_of() {
         let mut face = CardFace {
@@ -3700,14 +3737,7 @@ mod fabricate_runtime_tests {
         face.card_type.core_types.push(CoreType::Creature);
         synthesize_all(&mut face);
 
-        let mut state = GameState::new_two_player(42);
-        state.turn_number = 2;
-        state.phase = crate::types::phase::Phase::PreCombatMain;
-        state.active_player = PlayerId(0);
-        state.priority_player = PlayerId(0);
-        state.waiting_for = WaitingFor::Priority {
-            player: PlayerId(0),
-        };
+        let mut state = setup_state_with_priority(PlayerId(0));
 
         let next_card = CardId(state.next_object_id);
         let obj_id = create_object(
