@@ -682,7 +682,7 @@ fn source_has_collection_counter_play_permission(
     state.objects.get(&source).is_some_and(|source_obj| {
         source_obj.zone == Zone::Battlefield
             && source_obj.controller == player
-            && source_obj.static_definitions.iter_all().any(|def| {
+            && active_static_definitions(state, source_obj).any(|def| {
                 matches!(
                     &def.mode,
                     StaticMode::Other(name) if name == "LinkedCollectionCounterPlayPermission"
