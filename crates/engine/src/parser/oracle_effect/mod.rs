@@ -18661,6 +18661,62 @@ mod tests {
         );
     }
 
+    /// Issue #331: Inline conjunctive grants must parse both the keyword grant
+    /// and the trailing restriction grant when they share one sentence.
+    #[test]
+    fn sungold_style_inline_grant_keeps_hexproof_and_cant_be_blocked() {
+        use crate::types::keywords::{HexproofFilter, Keyword};
+        use crate::types::statics::StaticMode;
+
+        let def = parse_effect_chain(
+            "Choose a color. This creature gains hexproof from that color until end of turn and can't be blocked by creatures of that color this turn.",
+            AbilityKind::Activated,
+        );
+        let grant = def
+            .sub_ability
+            .as_ref()
+            .expect("must have sub_ability (Choose -> inline grant)");
+        let Effect::GenericEffect {
+            static_abilities, ..
+        } = &*grant.effect
+        else {
+            panic!("expected GenericEffect, got {:?}", grant.effect);
+        };
+        let modifications: Vec<_> = static_abilities
+            .iter()
+            .flat_map(|s| s.modifications.iter())
+            .collect();
+        assert!(
+            modifications.iter().any(|m| {
+                matches!(
+                    m,
+                    ContinuousModification::AddKeyword {
+                        keyword: Keyword::HexproofFrom(HexproofFilter::ChosenColor),
+                    }
+                )
+            }),
+            "expected typed HexproofFrom(ChosenColor), got {modifications:?}"
+        );
+        let Some(filter) = modifications.iter().find_map(|m| match m {
+            ContinuousModification::AddStaticMode {
+                mode: StaticMode::CantBeBlockedBy { filter },
+            } => Some(filter),
+            _ => None,
+        }) else {
+            panic!("expected AddStaticMode(CantBeBlockedBy), got {modifications:?}");
+        };
+        let TargetFilter::Typed(tf) = filter else {
+            panic!("expected typed filter, got {filter:?}");
+        };
+        assert!(
+            tf.properties
+                .iter()
+                .any(|prop| matches!(prop, FilterProp::IsChosenColor)),
+            "filter must contain IsChosenColor, got {:?}",
+            tf.properties
+        );
+    }
+
     #[test]
     fn effect_add_mana_any_color() {
         let e = parse_effect("Add one mana of any color");

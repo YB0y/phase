@@ -5768,7 +5768,9 @@ fn try_parse_attack_if_able(lower: &str) -> Option<ImperativeFamilyAst> {
 /// and compound forms like "can't attack or block". These delegate to the subject.rs
 /// static-granting machinery, wrapping the result in a `GenericEffect`.
 fn try_parse_subjectless_cant(lower: &str) -> Option<ImperativeFamilyAst> {
-    use crate::parser::oracle_effect::subject::parse_restriction_modes;
+    use crate::parser::oracle_effect::subject::{
+        parse_restriction_modes, static_mode_needs_grant_propagation,
+    };
 
     let trimmed = lower.trim_end_matches('.');
 
@@ -5793,16 +5795,7 @@ fn try_parse_subjectless_cant(lower: &str) -> Option<ImperativeFamilyAst> {
             // time. Without this, the runtime block / attack check never
             // sees the rule. Mirrors the injection in
             // `subject::build_restriction_clause`.
-            let needs_propagation = matches!(
-                mode,
-                StaticMode::CantBlock
-                    | StaticMode::CantAttack
-                    | StaticMode::CantAttackOrBlock
-                    | StaticMode::CantBeBlocked
-                    | StaticMode::CantBeBlockedBy { .. }
-                    | StaticMode::CantBeBlockedExceptBy { .. }
-                    | StaticMode::CantUntap
-            );
+            let needs_propagation = static_mode_needs_grant_propagation(&mode);
             let mut def = StaticDefinition::new(mode.clone());
             if needs_propagation {
                 def = def.modifications(vec![ContinuousModification::AddStaticMode { mode }]);

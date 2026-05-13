@@ -1870,16 +1870,7 @@ fn build_restriction_clause(
             // outer clause. The injection is intrinsic to the mode, not the
             // duration: intrinsic statics never reach this grant path
             // (`build_restriction_clause` is the subject-predicate route).
-            if matches!(
-                mode,
-                StaticMode::CantBlock
-                    | StaticMode::CantAttack
-                    | StaticMode::CantAttackOrBlock
-                    | StaticMode::CantBeBlocked
-                    | StaticMode::CantBeBlockedBy { .. }
-                    | StaticMode::CantBeBlockedExceptBy { .. }
-                    | StaticMode::CantUntap
-            ) {
+            if static_mode_needs_grant_propagation(&mode) {
                 def = def.modifications(vec![ContinuousModification::AddStaticMode {
                     mode: mode.clone(),
                 }]);
@@ -1902,6 +1893,19 @@ fn build_restriction_clause(
         optional: false,
         unless_pay: None,
     })
+}
+
+pub(crate) fn static_mode_needs_grant_propagation(mode: &StaticMode) -> bool {
+    matches!(
+        mode,
+        StaticMode::CantBlock
+            | StaticMode::CantAttack
+            | StaticMode::CantAttackOrBlock
+            | StaticMode::CantBeBlocked
+            | StaticMode::CantBeBlockedBy { .. }
+            | StaticMode::CantBeBlockedExceptBy { .. }
+            | StaticMode::CantUntap
+    )
 }
 
 /// Parse restriction predicates into one or more `StaticMode` variants.

@@ -11,7 +11,8 @@ use nom::sequence::{preceded, terminated};
 use nom::Parser;
 
 use super::oracle_cost::parse_oracle_cost;
-use super::oracle_effect::parse_effect_chain;
+use super::oracle_effect::subject::{parse_restriction_modes, static_mode_needs_grant_propagation};
+use super::oracle_effect::{parse_effect_chain, strip_trailing_duration};
 use super::oracle_ir::static_ir::StaticIr;
 use super::oracle_nom::bridge::nom_on_lower;
 use super::oracle_nom::condition as nom_condition;
@@ -6728,10 +6729,11 @@ fn parse_continuous_gets_has(
                     // e.g., "gets +1/+0 for each Mountain you control and has first strike"
                     if let Some(keyword_text) = extract_keyword_clause(description) {
                         for part in split_keyword_list(keyword_text.trim().trim_end_matches('.')) {
-                            if let Some(kw) = map_keyword(part.trim().trim_end_matches('.')) {
-                                modifications
-                                    .push(ContinuousModification::AddKeyword { keyword: kw });
-                            }
+                            push_grant_clause_modifications(
+                                &mut modifications,
+                                part.as_ref(),
+                                None,
+                            );
                         }
                     }
                     return Some(
@@ -6936,35 +6938,11 @@ pub(crate) fn parse_continuous_modifications(text: &str) -> Vec<ContinuousModifi
         }
     } else if let Some(keyword_text) = extract_keyword_clause(&unquoted_text) {
         for part in split_keyword_list(keyword_text.trim().trim_end_matches('.')) {
-            let part_trimmed = part.trim().trim_end_matches('.');
-            let part_lower = part_trimmed.to_lowercase();
-            // CR 702: Check for dynamic "keyword X" with "where X is [qty]"
-            if let Some(ref where_expr) = where_x_expression {
-                if let Ok((_, kw_name)) = terminated(
-                    alpha1::<_, OracleError<'_>>,
-                    preceded(space1, tag_no_case("x")),
-                )
-                .parse(part_lower.as_str())
-                {
-                    if let Some(kind) =
-                        crate::types::keywords::DynamicKeywordKind::from_name(kw_name)
-                    {
-                        if let Some(qty_ref) =
-                            crate::parser::oracle_quantity::parse_quantity_ref(where_expr)
-                        {
-                            modifications.push(ContinuousModification::AddDynamicKeyword {
-                                kind,
-                                value: QuantityExpr::Ref { qty: qty_ref },
-                            });
-                            continue;
-                        }
-                    }
-                }
-            }
-            // Fall through to normal AddKeyword
-            if let Some(kw) = map_keyword(part_trimmed) {
-                modifications.push(ContinuousModification::AddKeyword { keyword: kw });
-            }
+            push_grant_clause_modifications(
+                &mut modifications,
+                part.as_ref(),
+                where_x_expression.as_deref(),
+            );
         }
     }
 
@@ -6985,6 +6963,52 @@ pub(crate) fn parse_continuous_modifications(text: &str) -> Vec<ContinuousModifi
     modifications.extend(parse_becomes_type_addition_modifications(&unquoted_tp));
 
     modifications
+}
+
+fn push_grant_clause_modifications(
+    modifications: &mut Vec<ContinuousModification>,
+    part: &str,
+    where_x_expression: Option<&str>,
+) {
+    let part_trimmed = part.trim().trim_end_matches('.');
+    let (part_without_duration, _) = strip_trailing_duration(part_trimmed);
+    let part_trimmed = part_without_duration.trim().trim_end_matches('.');
+    let part_lower = part_trimmed.to_lowercase();
+
+    // CR 702: Check for dynamic "keyword X" with "where X is [qty]"
+    if let Some(where_expr) = where_x_expression {
+        if let Ok((_, kw_name)) = terminated(
+            alpha1::<_, OracleError<'_>>,
+            preceded(space1, tag_no_case("x")),
+        )
+        .parse(part_lower.as_str())
+        {
+            if let Some(kind) = crate::types::keywords::DynamicKeywordKind::from_name(kw_name) {
+                if let Some(qty_ref) =
+                    crate::parser::oracle_quantity::parse_quantity_ref(where_expr)
+                {
+                    modifications.push(ContinuousModification::AddDynamicKeyword {
+                        kind,
+                        value: QuantityExpr::Ref { qty: qty_ref },
+                    });
+                    return;
+                }
+            }
+        }
+    }
+
+    if let Some(kw) = map_keyword(part_trimmed) {
+        modifications.push(ContinuousModification::AddKeyword { keyword: kw });
+        return;
+    }
+
+    if let Some(modes) = parse_restriction_modes(part_lower.as_str()) {
+        for mode in modes {
+            if static_mode_needs_grant_propagation(&mode) {
+                modifications.push(ContinuousModification::AddStaticMode { mode });
+            }
+        }
+    }
 }
 
 fn strip_quoted_segments(text: &str) -> String {
@@ -11961,6 +11985,60 @@ mod tests {
                 ProtectionTarget::Color(ManaColor::Black),
                 ProtectionTarget::Color(ManaColor::Red),
             ]
+        );
+    }
+
+    #[test]
+    fn continuous_mods_grant_keyword_and_cant_be_blocked() {
+        let mods = parse_continuous_modifications("gains flying and can't be blocked this turn");
+        assert!(
+            mods.contains(&ContinuousModification::AddKeyword {
+                keyword: Keyword::Flying,
+            }),
+            "missing flying grant in {mods:?}"
+        );
+        assert!(
+            mods.iter().any(|m| matches!(
+                m,
+                ContinuousModification::AddStaticMode {
+                    mode: StaticMode::CantBeBlocked
+                }
+            )),
+            "missing CantBeBlocked grant in {mods:?}"
+        );
+    }
+
+    #[test]
+    fn continuous_mods_grant_chosen_color_hexproof_and_block_restriction() {
+        use crate::types::keywords::{HexproofFilter, Keyword};
+
+        let mods = parse_continuous_modifications(
+            "gains hexproof from that color until end of turn and can't be blocked by creatures of that color this turn",
+        );
+
+        assert!(
+            mods.contains(&ContinuousModification::AddKeyword {
+                keyword: Keyword::HexproofFrom(HexproofFilter::ChosenColor),
+            }),
+            "missing typed HexproofFrom(ChosenColor) grant in {mods:?}"
+        );
+
+        let Some(filter) = mods.iter().find_map(|m| match m {
+            ContinuousModification::AddStaticMode {
+                mode: StaticMode::CantBeBlockedBy { filter },
+            } => Some(filter),
+            _ => None,
+        }) else {
+            panic!("missing CantBeBlockedBy grant in {mods:?}");
+        };
+        let TargetFilter::Typed(tf) = filter else {
+            panic!("expected typed filter, got {filter:?}");
+        };
+        assert!(
+            tf.properties
+                .iter()
+                .any(|prop| matches!(prop, FilterProp::IsChosenColor)),
+            "missing IsChosenColor filter prop in {tf:?}"
         );
     }
 
