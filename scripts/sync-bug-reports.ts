@@ -393,7 +393,6 @@ async function cmdTriage(): Promise<void> {
   console.log(`  Corrections: ${byClass.get("correction") ?? 0}`);
   console.log(`  Chatter: ${byClass.get("chatter") ?? 0}`);
   console.log(`  Evidence-only: ${byClass.get("evidence_only") ?? 0}`);
-  console.log(`  Stale/likely fixed: ${byClass.get("stale_likely_fixed") ?? 0}`);
   console.log(`  ---`);
   console.log(`  Proposed: create_issue: ${byAction.get("create_issue") ?? 0}`);
   console.log(`  Proposed: append_to_existing: ${byAction.get("append_to_existing") ?? 0}`);
@@ -446,12 +445,12 @@ async function cmdCrossref(): Promise<void> {
 
   await writeJsonl(CROSSREF_PATH, items);
 
-  const counts = { likely_fixed: 0, still_broken: 0, unknown_card: 0, no_card: 0 };
+  const counts = { needs_semantic_verify: 0, still_broken: 0, unknown_card: 0, no_card: 0 };
   for (const item of items) counts[item.overall_status]++;
 
   console.log(`Cross-reference complete.`);
   console.log(`  Total items: ${items.length}`);
-  console.log(`  likely_fixed: ${counts.likely_fixed}`);
+  console.log(`  needs_semantic_verify: ${counts.needs_semantic_verify}`);
   console.log(`  still_broken: ${counts.still_broken}`);
   console.log(`  unknown_card: ${counts.unknown_card}`);
   console.log(`  no_card: ${counts.no_card}`);
@@ -486,13 +485,13 @@ async function cmdCrossref(): Promise<void> {
     }
   }
 
-  const fixed = items.filter((i) => i.overall_status === "likely_fixed");
-  summaryLines.push(`## Likely Fixed (${fixed.length} items)\n`);
-  const fixedByPrio = new Map<string, number>();
-  for (const item of fixed) {
-    fixedByPrio.set(item.priority, (fixedByPrio.get(item.priority) ?? 0) + 1);
+  const candidates = items.filter((i) => i.overall_status === "needs_semantic_verify");
+  summaryLines.push(`## Needs Semantic Verification (${candidates.length} items)\n`);
+  const candidatesByPrio = new Map<string, number>();
+  for (const item of candidates) {
+    candidatesByPrio.set(item.priority, (candidatesByPrio.get(item.priority) ?? 0) + 1);
   }
-  for (const [prio, count] of [...fixedByPrio.entries()].sort()) {
+  for (const [prio, count] of [...candidatesByPrio.entries()].sort()) {
     summaryLines.push(`- **${prio}**: ${count}`);
   }
   summaryLines.push(``);
@@ -541,16 +540,19 @@ async function cmdVerify(): Promise<void> {
       issue.title.toLowerCase().includes(c.cards[0]?.toLowerCase() ?? "___nomatch___"),
     );
 
-    if (matchingCrossref.length > 0 && matchingCrossref.every((c) => c.overall_status === "likely_fixed")) {
-      console.log(`  ✓ #${issue.number} ${issue.title.slice(0, 60)} → likely fixed`);
+    if (
+      matchingCrossref.length > 0 &&
+      matchingCrossref.every((c) => c.overall_status === "needs_semantic_verify")
+    ) {
+      console.log(`  ? #${issue.number} ${issue.title.slice(0, 60)} → needs semantic verification`);
       fixedCount++;
     }
   }
 
   if (fixedCount === 0) {
-    console.log("  No newly-fixed parser issues detected.");
+    console.log("  No parser issues became semantic-verification candidates.");
   } else {
-    console.log(`\n  ${fixedCount} issue(s) have fully-parsed cards. Transition to needs-runtime-verify:`);
+    console.log(`\n  ${fixedCount} issue(s) have fully-parsed cards. Inspect semantics before any status change:`);
     console.log(`    gh issue edit <N> --repo phase-rs/phase --remove-label "status:confirmed" --add-label "status:needs-runtime-verify"`);
     console.log(`  After runtime verification, close with:`);
     console.log(`    gh issue close <N> --repo phase-rs/phase --comment "Verified fixed in gameplay."`);

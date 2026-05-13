@@ -59,8 +59,7 @@ export type TriageClassification =
   | "developer_reply"
   | "correction"
   | "chatter"
-  | "evidence_only"
-  | "stale_likely_fixed";
+  | "evidence_only";
 
 export interface TriageItem {
   report_id: string;
