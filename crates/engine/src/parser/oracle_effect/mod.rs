@@ -1872,6 +1872,34 @@ fn try_parse_choose_one_of_inline(
     let (before_lower, after_lower) =
         split_around(tp.lower, ", or ").or_else(|| split_around(tp.lower, " or "))?;
 
+    // CR 119.7 + CR 119.8 + CR 104.2 + CR 104.3: When the left half contains a
+    // restriction-predicate marker ("can't", "cannot", "doesn't", "don't") at
+    // any word boundary, the "or" coordinates predicates within a single
+    // restriction — NOT two imperative choices. Everybody Lives! prints
+    // "players can't lose the game or win the game this turn"; without this
+    // guard, the detector mis-classifies the compound as
+    // ChooseOneOf(CantLoseTheGame, WinTheGame) because both halves happen to
+    // parse independently as supported effects. Restriction predicates are
+    // surface-level "subject can't <verb-list>" grammar and have no chooser
+    // semantic — defer to the subject+predicate path so
+    // `parse_restriction_modes` can recognize the compound. A single
+    // word-boundary scan with an `alt()` of the four negation forms covers
+    // both the start-of-string case ("can't ...") and the mid-string case
+    // ("<subject> can't ...") in one pass.
+    let has_restriction = nom_primitives::scan_at_word_boundaries(before_lower, |i| {
+        alt((
+            tag::<_, _, OracleError<'_>>("can't "),
+            tag("cannot "),
+            tag("doesn't "),
+            tag("don't "),
+        ))
+        .parse(i)
+    })
+    .is_some();
+    if has_restriction {
+        return None;
+    }
+
     // Multi-`or` chains and inner-noun disjunctions ("discard a creature card
     // or land, or sacrifice a creature") would split here at the FIRST `or`,
     // leaving the left half's inner ` or ` to be silently dropped by
