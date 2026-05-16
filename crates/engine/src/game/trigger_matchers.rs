@@ -521,6 +521,8 @@ pub(super) fn target_filter_matches_object(
     match filter {
         TargetFilter::None => false,
         TargetFilter::Player => false,
+        // CR 118.12a: unless-payer population — never matches an object.
+        TargetFilter::AllPlayers => false,
         TargetFilter::Controller => false,
         // CR 109.5: OriginalController is a player reference, not an object.
         TargetFilter::OriginalController => false,

@@ -14130,6 +14130,10 @@ fn parse_resolution_unless_payer(input: &str) -> OracleResult<'_, TargetFilter> 
             // controller (Stench of Evil, Fade Away) rather than a player
             // target (Flay).
             value(TargetFilter::Player, tag("they pay ")),
+            // CR 118.12a: "unless any player pays ..." — every player is polled
+            // in APNAP order; the first to pay prevents the effect (Cleansing,
+            // the Rhystic cycle, Soul Strings).
+            value(TargetFilter::AllPlayers, tag("any player pays ")),
         )),
     )
     .parse(input)
@@ -16333,6 +16337,38 @@ mod tests {
         );
         let unless_pay = def.unless_pay.expect("should attach unless_pay");
         assert_eq!(unless_pay.payer, TargetFilter::ParentTargetController);
+    }
+
+    /// CR 118.12a: "unless any player pays {N}" — the multi-payer poll payer
+    /// (`TargetFilter::AllPlayers`) with a mana cost (Rhystic cycle, Nakaya
+    /// Shade).
+    #[test]
+    fn effect_resolution_unless_any_player_pays_mana() {
+        let def = parse_effect_chain(
+            "Destroy target creature unless any player pays {2}",
+            AbilityKind::Spell,
+        );
+        let unless_pay = def.unless_pay.expect("should attach unless_pay");
+        assert_eq!(unless_pay.payer, TargetFilter::AllPlayers);
+        assert!(matches!(unless_pay.cost, AbilityCost::Mana { .. }));
+    }
+
+    /// CR 118.12a: "unless any player pays N life" — the multi-payer poll
+    /// payer with a life cost (Cleansing, Aether Rift).
+    #[test]
+    fn effect_resolution_unless_any_player_pays_life() {
+        let def = parse_effect_chain(
+            "Destroy target creature unless any player pays 1 life",
+            AbilityKind::Spell,
+        );
+        let unless_pay = def.unless_pay.expect("should attach unless_pay");
+        assert_eq!(unless_pay.payer, TargetFilter::AllPlayers);
+        assert!(matches!(
+            unless_pay.cost,
+            AbilityCost::PayLife {
+                amount: QuantityExpr::Fixed { value: 1 }
+            }
+        ));
     }
 
     /// CR 118.12a: Nicol Bolas, the Deceiver [+3] — "Each opponent loses 3

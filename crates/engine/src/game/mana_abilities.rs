@@ -1980,12 +1980,14 @@ fn resume_waiting_for(player: PlayerId, resume: ManaAbilityResume) -> WaitingFor
             pending_effect,
             trigger_event,
             effect_description,
+            remaining,
         } => WaitingFor::UnlessPayment {
             player,
             cost: *cost,
             pending_effect,
             trigger_event,
             effect_description,
+            remaining,
         },
     }
 }

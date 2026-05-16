@@ -1954,7 +1954,12 @@ pub fn resolve_ability_chain(
     // intercepted here for both tax triggers and counter-target-spell unless
     // costs. Post-fold, the cost is the unified `AbilityCost` taxonomy.
     if let Some(ref unless_pay) = ability.unless_pay {
-        if let Some(payer) = resolve_unless_payer(state, ability, &unless_pay.payer) {
+        // CR 118.12a: `resolve_unless_payers` yields the APNAP-ordered poll
+        // list — one player for ordinary unless-costs, every player for
+        // "unless any player pays ...". The first entry is prompted now; the
+        // rest ride along in `WaitingFor::UnlessPayment.remaining`.
+        let unless_payers = resolve_unless_payers(state, ability, &unless_pay.payer);
+        if let Some((&payer, remaining_payers)) = unless_payers.split_first() {
             // CR 118.4 + CR 107.3c: Resolve a dynamic-generic mana cost into a
             // fixed `Mana { cost }` BEFORE entering the prompt — the runtime
             // payment site only handles static AbilityCost variants.
@@ -2017,6 +2022,7 @@ pub fn resolve_ability_chain(
                         pending_effect: Box::new(pending),
                         trigger_event: state.current_trigger_event.clone(),
                         effect_description: ability.description.clone(),
+                        remaining: remaining_payers.to_vec(),
                     },
                 };
                 return Ok(());
@@ -3023,6 +3029,24 @@ fn resolve_unless_payer(
     }
 }
 
+/// CR 118.12a: Resolve an `UnlessPayModifier.payer` to the ordered list of
+/// players who may pay the unless-cost. Single-payer variants yield a
+/// one-element list (or empty when unresolvable); `TargetFilter::AllPlayers`
+/// ("unless any player pays ...") yields every player in APNAP order for the
+/// sequential poll — the first to pay prevents the effect.
+fn resolve_unless_payers(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    payer: &TargetFilter,
+) -> Vec<crate::types::player::PlayerId> {
+    match payer {
+        TargetFilter::AllPlayers => crate::game::players::apnap_order(state),
+        _ => resolve_unless_payer(state, ability, payer)
+            .into_iter()
+            .collect(),
+    }
+}
+
 /// CR 601.2f: "The next spell you cast this turn costs {N} less to cast."
 /// Pushes a one-shot cost reduction entry consumed when the player casts their next spell.
 fn resolve_reduce_next_spell_cost(
@@ -3828,6 +3852,52 @@ mod tests {
                         cost: ManaCost::generic(3),
                     }
                 );
+            }
+            other => panic!("expected WaitingFor::UnlessPayment, got {other:?}"),
+        }
+    }
+
+    /// CR 118.12a: an "unless any player pays" effect (`TargetFilter::AllPlayers`
+    /// payer) arms `WaitingFor::UnlessPayment` for the first player in APNAP
+    /// order with every other player queued in `remaining` for the poll.
+    #[test]
+    fn unless_pay_any_player_arms_apnap_poll() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Battlefield,
+        );
+        let mut ability = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: GainLifePlayer::Controller,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        ability.unless_pay = Some(crate::types::ability::UnlessPayModifier {
+            cost: AbilityCost::Mana {
+                cost: ManaCost::generic(2),
+            },
+            payer: TargetFilter::AllPlayers,
+        });
+
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &ability, &mut events, 0)
+            .expect("unless-pay interceptor should arm the poll");
+
+        match &state.waiting_for {
+            WaitingFor::UnlessPayment {
+                player, remaining, ..
+            } => {
+                // APNAP order from active player 0 → [P0, P1]: P0 prompted now,
+                // P1 queued.
+                assert_eq!(*player, PlayerId(0));
+                assert_eq!(remaining, &vec![PlayerId(1)]);
             }
             other => panic!("expected WaitingFor::UnlessPayment, got {other:?}"),
         }

@@ -443,7 +443,9 @@ fn filter_inner_for_object(
     match filter {
         TargetFilter::None => false,
         TargetFilter::Any => true,
-        TargetFilter::Player => false,     // Players are not objects
+        TargetFilter::Player => false, // Players are not objects
+        // CR 118.12a: unless-payer population — never matches an object.
+        TargetFilter::AllPlayers => false,
         TargetFilter::Controller => false, // Controller is a player, not an object
         // CR 109.5: OriginalController is a player reference, not an object.
         TargetFilter::OriginalController => false,
@@ -731,6 +733,8 @@ fn zone_change_filter_inner(
         TargetFilter::None => false,
         TargetFilter::Any => true,
         TargetFilter::Player => false,
+        // CR 118.12a: unless-payer population — never matches an object.
+        TargetFilter::AllPlayers => false,
         TargetFilter::Controller => false,
         // CR 109.5: OriginalController is a player reference, not an object.
         TargetFilter::OriginalController => false,
@@ -1063,6 +1067,8 @@ pub fn spell_record_matches_filter(
         // All remaining variants are inapplicable to spell snapshots.
         TargetFilter::None
         | TargetFilter::Player
+        // CR 118.12a: unless-payer population, never an object filter.
+        | TargetFilter::AllPlayers
         | TargetFilter::Controller
         | TargetFilter::OriginalController
         | TargetFilter::ScopedPlayer
@@ -1270,6 +1276,8 @@ fn spell_object_matches_filter_inner(
         ),
         TargetFilter::None
         | TargetFilter::Player
+        // CR 118.12a: unless-payer population, never an object filter.
+        | TargetFilter::AllPlayers
         | TargetFilter::Controller
         | TargetFilter::OriginalController
         | TargetFilter::ScopedPlayer

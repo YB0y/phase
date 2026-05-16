@@ -2267,6 +2267,13 @@ pub enum TargetFilter {
     /// Nexus of Fate's shuffle-back replacement when the card is under opposing
     /// control via Mind Control).
     Owner,
+    /// CR 118.12a: Every player in the game (controller + opponents), polled in
+    /// APNAP order. The unless-payer population for "[Effect] unless any player
+    /// pays ..." clauses (Cleansing, Rhystic cycle, Soul Strings). Resolution is
+    /// a sequential poll — the first player to pay prevents the effect — so this
+    /// variant is only valid as an `UnlessPayModifier.payer`; it is never used
+    /// as a target or affected filter.
+    AllPlayers,
 }
 
 /// CR 102 + CR 119 + CR 402: Player axis for player-scoped quantity references.

@@ -798,6 +798,11 @@ pub enum ManaAbilityResume {
         trigger_event: Option<GameEvent>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effect_description: Option<String>,
+        /// CR 118.12a: Carried-through "unless any player pays" poll list — see
+        /// `WaitingFor::UnlessPayment.remaining`. Survives the player tapping a
+        /// mana ability mid-payment.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        remaining: Vec<PlayerId>,
     },
 }
 
@@ -1720,6 +1725,13 @@ pub enum WaitingFor {
         /// Human-readable description for the frontend (e.g., "counter target spell", "draw a card").
         #[serde(default, skip_serializing_if = "Option::is_none")]
         effect_description: Option<String>,
+        /// CR 118.12a: Players still to poll after the current `player`, in
+        /// APNAP order. Non-empty only for "unless any player pays ..." clauses
+        /// (`TargetFilter::AllPlayers` payer): if `player` declines, the next
+        /// player in `remaining` is prompted; the first to pay prevents the
+        /// effect. Empty for ordinary single-payer unless-costs (Mana Leak).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        remaining: Vec<PlayerId>,
     },
     /// CR 118.12a: Player must choose **which** sub-cost to pay from a
     /// disjunctive ("unless they X or Y") unless-cost. Once a sub-cost is

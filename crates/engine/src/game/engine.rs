@@ -12553,6 +12553,7 @@ mod phase_trigger_regression_tests {
             pending_effect: Box::new(ability),
             trigger_event: None,
             effect_description: None,
+            remaining: Vec::new(),
         };
 
         let result =
@@ -12617,6 +12618,7 @@ mod phase_trigger_regression_tests {
             pending_effect: Box::new(primary),
             trigger_event: None,
             effect_description: None,
+            remaining: Vec::new(),
         };
 
         let starting_life = state.players[0].life;
@@ -12670,6 +12672,7 @@ mod phase_trigger_regression_tests {
             pending_effect: Box::new(primary),
             trigger_event: None,
             effect_description: None,
+            remaining: Vec::new(),
         };
 
         let starting_life = state.players[0].life;
@@ -12712,6 +12715,7 @@ mod phase_trigger_regression_tests {
             pending_effect: Box::new(primary),
             trigger_event: None,
             effect_description: None,
+            remaining: Vec::new(),
         };
 
         let starting_life = state.players[0].life;
@@ -12769,6 +12773,7 @@ mod phase_trigger_regression_tests {
             pending_effect: Box::new(primary),
             trigger_event: None,
             effect_description: None,
+            remaining: Vec::new(),
         };
 
         let starting_life = state.players[0].life;
@@ -12807,6 +12812,7 @@ mod phase_trigger_regression_tests {
             )),
             trigger_event: None,
             effect_description: None,
+            remaining: Vec::new(),
         };
 
         let result = apply_as_current(&mut state, GameAction::PayUnlessCost { pay: true }).unwrap();
@@ -12868,6 +12874,7 @@ mod phase_trigger_regression_tests {
             pending_effect: Box::new(draw_that_many(source_id, PlayerId(0))),
             trigger_event: None,
             effect_description: None,
+            remaining: Vec::new(),
         };
 
         let result = apply_as_current(&mut state, GameAction::PayUnlessCost { pay: true }).unwrap();
