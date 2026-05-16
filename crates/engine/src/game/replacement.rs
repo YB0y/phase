@@ -100,7 +100,7 @@ pub fn replacement_choice_waiting_for(player: PlayerId, state: &GameState) -> Wa
                         .and_then(|obj| obj.replacement_definitions.get(p.candidates[0].index))
                         .map(|repl| match &repl.mode {
                             ReplacementMode::MayCost { cost, .. } => {
-                                format!("Pay {}", replacement_cost_description(cost))
+                                replacement_cost_description(cost)
                             }
                             ReplacementMode::Mandatory | ReplacementMode::Optional { .. } => repl
                                 .description
@@ -133,11 +133,46 @@ pub fn replacement_choice_waiting_for(player: PlayerId, state: &GameState) -> Wa
     }
 }
 
+/// CR 614.12a: Human-readable accept-label for a `MayCost` replacement prompt.
+/// Returns a complete imperative phrase (the caller no longer prepends "Pay ")
+/// so non-mana costs read naturally. Exhaustive — a new `AbilityCost` variant
+/// forces a deliberate label decision here.
 fn replacement_cost_description(cost: &AbilityCost) -> String {
     match cost {
-        AbilityCost::Mana { cost } => format!("{cost:?}"),
-        AbilityCost::PayLife { amount } => format!("{amount:?} life"),
-        _ => "cost".to_string(),
+        AbilityCost::Mana { cost } => format!("Pay {cost:?}"),
+        AbilityCost::PayLife { amount } => format!("Pay {amount:?} life"),
+        // CR 614.12a: Karoo self-ETB cost lands.
+        AbilityCost::Sacrifice { count, .. } => {
+            if *count == 1 {
+                "Sacrifice a permanent".to_string()
+            } else {
+                format!("Sacrifice {count} permanents")
+            }
+        }
+        AbilityCost::Discard { .. } => "Discard a card".to_string(),
+        AbilityCost::ManaDynamic { .. }
+        | AbilityCost::Tap
+        | AbilityCost::Untap
+        | AbilityCost::Loyalty { .. }
+        | AbilityCost::Exile { .. }
+        | AbilityCost::CollectEvidence { .. }
+        | AbilityCost::TapCreatures { .. }
+        | AbilityCost::RemoveCounter { .. }
+        | AbilityCost::PayEnergy { .. }
+        | AbilityCost::PaySpeed { .. }
+        | AbilityCost::ReturnToHand { .. }
+        | AbilityCost::Unattach
+        | AbilityCost::Mill { .. }
+        | AbilityCost::Exert
+        | AbilityCost::Blight { .. }
+        | AbilityCost::Reveal { .. }
+        | AbilityCost::Behold { .. }
+        | AbilityCost::Composite { .. }
+        | AbilityCost::OneOf { .. }
+        | AbilityCost::Waterbend { .. }
+        | AbilityCost::NinjutsuFamily { .. }
+        | AbilityCost::EffectCost { .. }
+        | AbilityCost::Unimplemented { .. } => "Pay cost".to_string(),
     }
 }
 

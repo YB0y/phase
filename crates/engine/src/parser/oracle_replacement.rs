@@ -154,6 +154,12 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
         return Some(def);
     }
 
+    // --- Karoo self-ETB cost lands: "If this land would enter, sacrifice ...
+    //     instead. If you do, ... If you don't, put it into its owner's graveyard." ---
+    if let Some(def) = parse_self_enters_pay_cost_replacement(&norm_lower, &normalized, &text) {
+        return Some(def);
+    }
+
     // --- "If ~ would die, {effect}" ---
     if nom_primitives::scan_contains(&norm_lower, "~ would die")
         || nom_primitives::scan_contains(&norm_lower, "~ would be destroyed")
@@ -416,6 +422,109 @@ fn parse_discard_self_to_battlefield_replacement(
             .condition(ReplacementCondition::EventSourceControlledBy {
                 controller: ControllerRef::Opponent,
             })
+            .description(original_text.to_string()),
+    )
+}
+
+/// CR 614.1a + CR 614.12 + CR 614.12a: Karoo-style self-ETB cost replacement.
+///
+/// Recognizes "If this {land|artifact} would enter, {sacrifice <filter> | you
+/// may discard <filter>} instead. If you do, put this {land|artifact} onto the
+/// battlefield. If you don't, put it into its owner's graveyard." — the 8-card
+/// Karoo class (Lotus Vale, Scorched Ruins, Mox Diamond, etc.).
+///
+/// Emits a `ReplacementMode::MayCost` on the `Moved` event: the accept-cost is
+/// the parsed `AbilityCost::Sacrifice`/`Discard`; the decline branch redirects
+/// the ETB destination to the owner's graveyard via `Effect::ChangeZone` so the
+/// permanent never appears on the battlefield (CR 614 — no ETB/LTB triggers).
+fn parse_self_enters_pay_cost_replacement(
+    norm_lower: &str,
+    normalized: &str,
+    original_text: &str,
+) -> Option<ReplacementDefinition> {
+    // Prefix: "if {this land|this artifact|~} would enter, ".
+    let ((), after_prefix) = nom_on_lower(normalized, norm_lower, |i| {
+        value(
+            (),
+            preceded(
+                tag("if "),
+                alt((
+                    tag("this land would enter, "),
+                    tag("this artifact would enter, "),
+                    tag("~ would enter, "),
+                )),
+            ),
+        )
+        .parse(i)
+    })?;
+
+    // Isolate the cost body from the boilerplate tail at " instead. ".
+    let after_prefix_lower = after_prefix.to_lowercase();
+    let (cost_body, tail) = split_once_on_lower(after_prefix, &after_prefix_lower, " instead. ")?;
+
+    // Cost: strip an optional non-cost "you may " lead-in (Mox Diamond), then
+    // delegate the verb-inclusive residue to `parse_single_cost` — it consumes
+    // the "sacrifice "/"discard " verb itself.
+    let cost_body = cost_body.trim();
+    let cost_body_lower = cost_body.to_lowercase();
+    let cost_text = nom_on_lower(cost_body, &cost_body_lower, |i| {
+        value((), tag("you may ")).parse(i)
+    })
+    .map_or(cost_body, |((), rest)| rest);
+    let cost = crate::parser::oracle_cost::parse_single_cost(cost_text);
+    // Guard: only Sacrifice / Discard are valid Karoo accept-costs.
+    if !matches!(
+        cost,
+        AbilityCost::Sacrifice { .. } | AbilityCost::Discard { .. }
+    ) {
+        return None;
+    }
+
+    // Tail boilerplate must match fully (guards against false positives).
+    let tail_lower = tail.to_lowercase();
+    let ((), tail_rest) = nom_on_lower(tail, &tail_lower, |i| {
+        value(
+            (),
+            (
+                tag("if you do, put "),
+                alt((tag("this land"), tag("this artifact"), tag("~"), tag("it"))),
+                tag(" onto the battlefield. if you don't, put it into its owner's graveyard"),
+                opt(char('.')),
+            ),
+        )
+        .parse(i)
+    })?;
+    if !tail_rest.trim().is_empty() {
+        return None;
+    }
+
+    // CR 614.1 + CR 614.12: the decline branch redirects the ETB destination to
+    // the owner's graveyard so the permanent never enters the battlefield (no
+    // ETB/LTB triggers fire). Routed through the engine's existing zone-redirect
+    // path via `Effect::ChangeZone`.
+    let decline = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::ChangeZone {
+            origin: None,
+            destination: Zone::Graveyard,
+            target: TargetFilter::SelfRef,
+            owner_library: false,
+            enter_transformed: false,
+            under_your_control: false,
+            enter_tapped: false,
+            enters_attacking: false,
+            up_to: false,
+            enter_with_counters: vec![],
+        },
+    );
+
+    Some(
+        ReplacementDefinition::new(ReplacementEvent::Moved)
+            .mode(ReplacementMode::MayCost {
+                cost,
+                decline: Some(Box::new(decline)),
+            })
+            .valid_card(TargetFilter::SelfRef)
             .description(original_text.to_string()),
     )
 }
@@ -4263,6 +4372,83 @@ mod tests {
                 assert_eq!(*active_player_req, None);
             }
             other => panic!("expected OnlyIfQuantity, got {other:?}"),
+        }
+    }
+
+    /// CR 614.1a + CR 614.12a: Karoo land — untyped multi-sacrifice cost
+    /// (Lotus Vale, Scorched Ruins). Parses to a `MayCost` `Moved` replacement
+    /// whose accept-cost is `Sacrifice { count: 2 }` and whose decline branch
+    /// redirects the ETB to the owner's graveyard.
+    #[test]
+    fn karoo_land_sacrifice_count_replacement() {
+        let def = parse_replacement_line(
+            "If this land would enter, sacrifice two untapped lands instead. If you do, \
+             put this land onto the battlefield. If you don't, put it into its owner's graveyard.",
+            "Lotus Vale",
+        )
+        .expect("Karoo land should parse as a replacement");
+        assert_eq!(def.event, ReplacementEvent::Moved);
+        assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+        match &def.mode {
+            ReplacementMode::MayCost { cost, decline } => {
+                assert!(
+                    matches!(cost, AbilityCost::Sacrifice { count: 2, .. }),
+                    "expected Sacrifice count 2, got {cost:?}"
+                );
+                let decline = decline.as_ref().expect("Karoo decline branch");
+                assert!(matches!(
+                    &*decline.effect,
+                    Effect::ChangeZone {
+                        destination: Zone::Graveyard,
+                        ..
+                    }
+                ));
+            }
+            other => panic!("expected MayCost, got {other:?}"),
+        }
+    }
+
+    /// CR 614.1a: Karoo land — typed single-sacrifice cost (Heart of Yavimaya
+    /// "sacrifice a Forest", Balduvian Trading Post "an untapped Mountain").
+    #[test]
+    fn karoo_land_typed_single_sacrifice_replacement() {
+        let def = parse_replacement_line(
+            "If this land would enter, sacrifice a Forest instead. If you do, put this \
+             land onto the battlefield. If you don't, put it into its owner's graveyard.",
+            "Heart of Yavimaya",
+        )
+        .expect("Karoo land should parse as a replacement");
+        match &def.mode {
+            ReplacementMode::MayCost { cost, .. } => {
+                assert!(
+                    matches!(cost, AbilityCost::Sacrifice { count: 1, .. }),
+                    "expected Sacrifice count 1, got {cost:?}"
+                );
+            }
+            other => panic!("expected MayCost, got {other:?}"),
+        }
+    }
+
+    /// CR 614.12a: Karoo artifact — Mox Diamond's "you may discard ..." cost.
+    /// The non-cost "you may " lead-in is stripped before `parse_single_cost`.
+    #[test]
+    fn karoo_artifact_discard_replacement() {
+        let def = parse_replacement_line(
+            "If this artifact would enter, you may discard a land card instead. If you do, \
+             put this artifact onto the battlefield. If you don't, put it into its owner's graveyard.",
+            "Mox Diamond",
+        )
+        .expect("Mox Diamond should parse as a replacement");
+        assert_eq!(def.event, ReplacementEvent::Moved);
+        match &def.mode {
+            ReplacementMode::MayCost { cost, decline } => {
+                assert!(
+                    matches!(cost, AbilityCost::Discard { .. }),
+                    "expected Discard cost, got {cost:?}"
+                );
+                assert!(decline.is_some(), "Mox Diamond needs a decline branch");
+            }
+            other => panic!("expected MayCost, got {other:?}"),
         }
     }
 
