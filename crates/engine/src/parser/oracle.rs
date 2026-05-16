@@ -827,14 +827,16 @@ fn is_spell_resolution_instruction_line(
 /// - Ferocious: you control a creature with power 4 or greater
 fn ability_word_to_condition(word: &str) -> Option<crate::types::ability::StaticCondition> {
     use crate::types::ability::{
-        CardTypeSetSource, ControllerRef, CountScope, FilterProp, QuantityExpr, QuantityRef,
-        StaticCondition, TargetFilter, TypeFilter, TypedFilter, ZoneRef,
+        CardTypeSetSource, ControllerRef, CountScope, FilterProp, PlayerScope, QuantityExpr,
+        QuantityRef, StaticCondition, TargetFilter, TypeFilter, TypedFilter, ZoneRef,
     };
 
     match word {
         "threshold" => Some(StaticCondition::QuantityComparison {
             lhs: QuantityExpr::Ref {
-                qty: QuantityRef::GraveyardSize,
+                qty: QuantityRef::GraveyardSize {
+                    player: PlayerScope::Controller,
+                },
             },
             comparator: Comparator::GE,
             rhs: QuantityExpr::Fixed { value: 7 },

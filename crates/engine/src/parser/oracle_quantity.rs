@@ -225,7 +225,9 @@ pub(crate) fn canonicalize_quantity_ref(qty: QuantityRef) -> QuantityRef {
             zone: ZoneRef::Graveyard,
             card_types,
             scope: CountScope::Controller,
-        } if card_types.is_empty() => QuantityRef::GraveyardSize,
+        } if card_types.is_empty() => QuantityRef::GraveyardSize {
+            player: PlayerScope::Controller,
+        },
         other => other,
     }
 }
@@ -2288,7 +2290,9 @@ mod tests {
         assert_eq!(
             result,
             Some(QuantityExpr::Ref {
-                qty: QuantityRef::GraveyardSize,
+                qty: QuantityRef::GraveyardSize {
+                    player: PlayerScope::Controller,
+                },
             })
         );
     }

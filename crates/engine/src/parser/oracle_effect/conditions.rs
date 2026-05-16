@@ -1682,6 +1682,12 @@ fn static_condition_to_ability_condition(
             rhs: rhs.clone(),
         }),
         StaticCondition::HasMaxSpeed => Some(AbilityCondition::HasMaxSpeed),
+        // CR 103.1: Starting-player status — 1:1 bridge (same `controller` field).
+        StaticCondition::WasStartingPlayer { controller } => {
+            Some(AbilityCondition::WasStartingPlayer {
+                controller: controller.clone(),
+            })
+        }
         StaticCondition::IsMonarch => Some(AbilityCondition::IsMonarch),
         StaticCondition::HasCityBlessing => Some(AbilityCondition::HasCityBlessing),
         StaticCondition::DayNightIs { state } => {
@@ -1755,6 +1761,12 @@ fn static_condition_to_ability_condition(
             }),
             StaticCondition::DayNightIs { state } => Some(AbilityCondition::Not {
                 condition: Box::new(AbilityCondition::DayNightIs { state: *state }),
+            }),
+            // CR 103.1: "you weren't the starting player" → Not(WasStartingPlayer).
+            StaticCondition::WasStartingPlayer { controller } => Some(AbilityCondition::Not {
+                condition: Box::new(AbilityCondition::WasStartingPlayer {
+                    controller: controller.clone(),
+                }),
             }),
             _ => None,
         },

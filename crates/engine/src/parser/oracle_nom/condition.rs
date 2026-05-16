@@ -349,6 +349,27 @@ fn parse_player_state_conditions(input: &str) -> OracleResult<'_, StaticConditio
             StaticCondition::CompletedADungeon,
             tag("you've completed a dungeon"),
         ),
+        // CR 103.1: Starting-player status. "you weren't the starting player"
+        // (Radiant Smite, Cindercone Smite, Sylvan Smite) is the dominant
+        // idiom; the affirmative form composes the same variant. Negation is
+        // tried first so the longer "weren't" tag wins over "were".
+        map(
+            alt((
+                tag("you weren't the starting player"),
+                tag("you were not the starting player"),
+            )),
+            |_| StaticCondition::Not {
+                condition: Box::new(StaticCondition::WasStartingPlayer {
+                    controller: ControllerRef::You,
+                }),
+            },
+        ),
+        value(
+            StaticCondition::WasStartingPlayer {
+                controller: ControllerRef::You,
+            },
+            tag("you were the starting player"),
+        ),
         // CR 903.3: Commander control (Lieutenant mechanic)
         value(
             StaticCondition::ControlsCommander,
@@ -1146,7 +1167,15 @@ fn parse_you_have_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
     if let Ok((rest, _)) =
         tag::<_, _, OracleError<'_>>(" or more cards in your graveyard").parse(rest)
     {
-        return Ok((rest, make_quantity_ge(QuantityRef::GraveyardSize, n)));
+        return Ok((
+            rest,
+            make_quantity_ge(
+                QuantityRef::GraveyardSize {
+                    player: PlayerScope::Controller,
+                },
+                n,
+            ),
+        ));
     }
     if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(" or more life").parse(rest) {
         return Ok((
@@ -3588,7 +3617,9 @@ fn parse_subject_first_zone_count(input: &str) -> OracleResult<'_, StaticConditi
         && matches!(zone, crate::types::ability::ZoneRef::Graveyard)
         && matches!(scope, CountScope::Controller)
     {
-        QuantityRef::GraveyardSize
+        QuantityRef::GraveyardSize {
+            player: PlayerScope::Controller,
+        }
     } else {
         QuantityRef::ZoneCardCount {
             zone,
@@ -3959,6 +3990,31 @@ fn parse_opponent_comparison_conditions(input: &str) -> OracleResult<'_, StaticC
                 },
             },
         ));
+    }
+
+    // CR 404 + CR 603.4: "an opponent has N or more cards in their graveyard"
+    // → QuantityComparison(GraveyardSize[Opponent] >= N). Merfolk Windrobber's
+    // activation restriction and See Double's "you may choose both instead"
+    // both read this. The opponent graveyard is aggregated with `Max` so the
+    // condition holds when ANY opponent meets the threshold (CR 102.2).
+    if let Ok((rest2, _)) = tag::<_, _, OracleError<'_>>("has ").parse(rest) {
+        if let Ok((rest3, n)) = parse_number(rest2) {
+            if let Ok((rest4, _)) =
+                tag::<_, _, OracleError<'_>>(" or more cards in their graveyard").parse(rest3)
+            {
+                return Ok((
+                    rest4,
+                    make_quantity_ge(
+                        QuantityRef::GraveyardSize {
+                            player: PlayerScope::Opponent {
+                                aggregate: AggregateFunction::Max,
+                            },
+                        },
+                        n,
+                    ),
+                ));
+            }
+        }
     }
 
     Err(nom::Err::Error(nom::error::Error::new(
@@ -4599,7 +4655,10 @@ mod tests {
             StaticCondition::QuantityComparison {
                 lhs:
                     QuantityExpr::Ref {
-                        qty: QuantityRef::GraveyardSize,
+                        qty:
+                            QuantityRef::GraveyardSize {
+                                player: PlayerScope::Controller,
+                            },
                     },
                 comparator: Comparator::GE,
                 rhs: QuantityExpr::Fixed { value: 5 },
@@ -5098,7 +5157,10 @@ mod tests {
             StaticCondition::QuantityComparison {
                 lhs:
                     QuantityExpr::Ref {
-                        qty: QuantityRef::GraveyardSize,
+                        qty:
+                            QuantityRef::GraveyardSize {
+                                player: PlayerScope::Controller,
+                            },
                     },
                 comparator: Comparator::GE,
                 rhs: QuantityExpr::Fixed { value: 7 },
@@ -5461,6 +5523,34 @@ mod tests {
         assert_eq!(c, StaticCondition::HasCityBlessing);
     }
 
+    #[test]
+    fn test_was_starting_player() {
+        // CR 103.1: affirmative form.
+        let (rest, c) = parse_inner_condition("you were the starting player").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(
+            c,
+            StaticCondition::WasStartingPlayer {
+                controller: ControllerRef::You,
+            }
+        );
+    }
+
+    #[test]
+    fn test_wasnt_starting_player() {
+        // CR 103.1: negated form (Radiant Smite, Cindercone Smite, Sylvan Smite).
+        let (rest, c) = parse_inner_condition("you weren't the starting player").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(
+            c,
+            StaticCondition::Not {
+                condition: Box::new(StaticCondition::WasStartingPlayer {
+                    controller: ControllerRef::You,
+                }),
+            }
+        );
+    }
+
     // -- "you have N or less" conditions --
 
     #[test]
@@ -5786,6 +5876,32 @@ mod tests {
                     },
             } => {}
             other => panic!("expected OpponentLifeTotal GT LifeTotal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_opponent_has_n_cards_in_graveyard() {
+        // CR 404 + CR 603.4: Merfolk Windrobber / See Double intervening-if.
+        let (rest, c) =
+            parse_inner_condition("an opponent has eight or more cards in their graveyard")
+                .unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::GraveyardSize {
+                                player:
+                                    PlayerScope::Opponent {
+                                        aggregate: AggregateFunction::Max,
+                                    },
+                            },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 8 },
+            } => {}
+            other => panic!("expected opponent GraveyardSize GE 8, got {other:?}"),
         }
     }
 

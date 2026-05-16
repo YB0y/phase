@@ -2667,6 +2667,11 @@ pub(crate) fn check_trigger_condition(
                 false
             }
         }
+        // CR 103.1: True when the scoped player took the first turn of the
+        // game (fixed at game start). The parser only emits
+        // `ControllerRef::You` (Radiant Smite's Cycling trigger — "if you
+        // weren't the starting player").
+        TriggerCondition::WasStartingPlayer { .. } => state.current_starting_player == controller,
         // CR 725.1: True when the controller is the monarch.
         TriggerCondition::IsMonarch => state.monarch == Some(controller),
         // CR 702.131a: True when the controller has the city's blessing.

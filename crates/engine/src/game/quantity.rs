@@ -640,8 +640,11 @@ fn resolve_ref(
                 .sum();
             i32::try_from(total).unwrap_or(i32::MAX)
         }
-        QuantityRef::GraveyardSize => {
-            player.map_or(0, |p| usize_to_i32_saturating(p.graveyard.len()))
+        // CR 404: cards in the scoped player(s)' graveyard.
+        QuantityRef::GraveyardSize { player: scope } => {
+            resolve_per_player_scalar(state, *scope, controller, ctx, targets, |p| {
+                usize_to_i32_saturating(p.graveyard.len())
+            })
         }
         QuantityRef::LifeAboveStarting => {
             player.map_or(0, |p| p.life - state.format_config.starting_life)

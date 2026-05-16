@@ -758,7 +758,9 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
         QuantityRef::LifeTotal { player } => {
             format!("life total ({})", fmt_player_scope(*player))
         }
-        QuantityRef::GraveyardSize => "cards in graveyard".into(),
+        QuantityRef::GraveyardSize { player } => {
+            format!("cards in graveyard ({})", fmt_player_scope(*player))
+        }
         QuantityRef::LifeAboveStarting => "life above starting".into(),
         QuantityRef::StartingLifeTotal => "starting life total".into(),
         QuantityRef::Speed => "speed".into(),
@@ -4760,6 +4762,8 @@ fn condition_feature(cond: &AbilityCondition) -> (&'static str, FeatureSupport) 
         AbilityCondition::TargetHasKeywordInstead { .. } => ("TargetHasKeywordInstead", Handled),
         // CR 608.2c: active-player check; handled by `evaluate_condition` (effects/mod.rs).
         AbilityCondition::IsYourTurn => ("IsYourTurn", Handled),
+        // CR 103.1: starting-player check; handled by `evaluate_condition` (effects/mod.rs).
+        AbilityCondition::WasStartingPlayer { .. } => ("WasStartingPlayer", Handled),
         // CR 500.8 + CR 506.1 + CR 608.2c: combat-phase count check; handled by
         // `evaluate_condition` (effects/mod.rs).
         AbilityCondition::FirstCombatPhaseOfTurn => ("FirstCombatPhaseOfTurn", Handled),
@@ -4807,7 +4811,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
     match qref {
         QuantityRef::HandSize { .. } => ("HandSize", Handled),
         QuantityRef::LifeTotal { .. } => ("LifeTotal", Handled),
-        QuantityRef::GraveyardSize => ("GraveyardSize", Handled),
+        QuantityRef::GraveyardSize { .. } => ("GraveyardSize", Handled),
         QuantityRef::LifeAboveStarting => ("LifeAboveStarting", Handled),
         QuantityRef::StartingLifeTotal => ("StartingLifeTotal", Unhandled),
         QuantityRef::Speed => ("Speed", Handled),
@@ -4974,6 +4978,8 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         StaticCondition::IsMonarch => ("IsMonarch", Handled),
         StaticCondition::HasCityBlessing => ("HasCityBlessing", Handled),
         StaticCondition::CompletedADungeon => ("CompletedADungeon", Unhandled),
+        // CR 103.1: bridges to Ability/Trigger `WasStartingPlayer`, both runtime-handled.
+        StaticCondition::WasStartingPlayer { .. } => ("WasStartingPlayer", Handled),
         StaticCondition::OpponentPoisonAtLeast { .. } => ("OpponentPoisonAtLeast", Unhandled),
         StaticCondition::UnlessPay { .. } => ("UnlessPay", Handled),
         StaticCondition::ControlsCommander => ("ControlsCommander", Unhandled),

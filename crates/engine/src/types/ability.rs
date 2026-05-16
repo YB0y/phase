@@ -2404,8 +2404,12 @@ pub enum QuantityRef {
     /// CR 119: `player`'s current life total. See `HandSize` for player-axis
     /// semantics.
     LifeTotal { player: PlayerScope },
-    /// Number of cards in the controller's graveyard.
-    GraveyardSize,
+    /// CR 404: Number of cards in the scoped player's graveyard. `PlayerScope`
+    /// follows the same player-axis semantics as `HandSize` / `LifeTotal`:
+    /// `Controller` is the default ("your graveyard"); `Opponent { aggregate }`
+    /// covers "an opponent['s] graveyard" thresholds (e.g. Merfolk Windrobber,
+    /// See Double — "if an opponent has eight or more cards in their graveyard").
+    GraveyardSize { player: PlayerScope },
     /// Controller's life total minus the format's starting life total.
     /// Used for "N or more life more than your starting life total" conditions.
     LifeAboveStarting,
@@ -3289,6 +3293,14 @@ pub enum StaticCondition {
     /// CR 309.7: True when the controller has completed at least one dungeon.
     /// Used by "as long as you've completed a dungeon" statics (Nadaar, etc.).
     CompletedADungeon,
+    /// CR 103.1: True when the scoped player was the starting player (took the
+    /// first turn of the game). Fixed at game start
+    /// (`GameState.current_starting_player`). For "if you weren't the starting
+    /// player", wrap with `StaticCondition::Not`. `controller` selects whose
+    /// start status is checked; `ControllerRef::You` is the canonical reading.
+    WasStartingPlayer {
+        controller: ControllerRef,
+    },
     /// CR 701.27: True when any opponent has at least this many poison counters.
     OpponentPoisonAtLeast {
         count: u32,
@@ -7646,6 +7658,14 @@ pub enum AbilityCondition {
     /// is the ability's controller. For "if it's not your turn", wrap with
     /// `AbilityCondition::Not`.
     IsYourTurn,
+    /// CR 103.1 + CR 608.2c: "if you were the starting player" — gates a
+    /// follow-up effect on whether the scoped player took the first turn of
+    /// the game. The starting player is fixed at game start
+    /// (`GameState.current_starting_player`). For "if you weren't the starting
+    /// player" (Radiant Smite, Cindercone Smite), wrap with
+    /// `AbilityCondition::Not`. `controller` selects whose start status is
+    /// checked; `ControllerRef::You` is the canonical reading.
+    WasStartingPlayer { controller: ControllerRef },
     /// CR 500.8 + CR 506.1 + CR 608.2c: "if it's the first combat phase of the turn".
     /// Gates a follow-up effect on whether this is the first combat phase started this turn.
     FirstCombatPhaseOfTurn,
@@ -7982,6 +8002,13 @@ pub enum TriggerCondition {
 
     /// CR 725.1: "if you're the monarch" is true when the controller is the monarch.
     IsMonarch,
+    /// CR 103.1: "if you were/weren't the starting player" — true when the
+    /// scoped player took the first turn of the game
+    /// (`GameState.current_starting_player`). Used by Radiant Smite's Cycling
+    /// trigger ("When you cycle Radiant Smite, if you weren't the starting
+    /// player, ..."). Negation is expressed via `Not`. `controller` selects
+    /// whose start status is checked.
+    WasStartingPlayer { controller: ControllerRef },
     /// CR 702.131a: "if you have the city's blessing" — true when the controller has Ascend.
     HasCityBlessing,
     /// CR 309.7: True when the controller has completed a dungeon.

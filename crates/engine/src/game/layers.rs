@@ -378,6 +378,9 @@ fn evaluate_condition_with_context(
             .is_some_and(|current| current >= *level),
         StaticCondition::Unrecognized { .. } => true,
         StaticCondition::DuringYourTurn => state.active_player == controller,
+        // CR 103.1: True when the scoped player took the first turn of the
+        // game (fixed at game start). The parser emits `ControllerRef::You`.
+        StaticCondition::WasStartingPlayer { .. } => state.current_starting_player == controller,
         // CR 400.7: True when the source permanent entered the battlefield this turn.
         StaticCondition::SourceEnteredThisTurn => state
             .objects

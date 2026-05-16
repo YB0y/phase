@@ -659,6 +659,7 @@ fn should_resolve_subability_on_optional_decline(ability: &ResolvedAbility) -> b
             | AbilityCondition::ZoneChangeObjectMatchesFilter { .. }
             | AbilityCondition::ControllerControlsMatching { .. }
             | AbilityCondition::IsYourTurn
+            | AbilityCondition::WasStartingPlayer { .. }
             | AbilityCondition::FirstCombatPhaseOfTurn
             | AbilityCondition::ZoneChangedThisWay { .. }
             | AbilityCondition::CostPaidObjectMatchesFilter { .. }
@@ -2963,6 +2964,18 @@ fn evaluate_condition(
             .get(&ability.source_id)
             .is_some_and(|obj| obj.colors_spent_to_cast.get(*color) >= *minimum),
         AbilityCondition::HasMaxSpeed => has_max_speed(state, ability.controller),
+        // CR 103.1: True when the scoped player took the first turn of the
+        // game. The parser only emits `ControllerRef::You` (Radiant Smite,
+        // Cindercone Smite, Sylvan Smite — "if you weren't the starting
+        // player"); `ScopedPlayer` resolves to the per-instruction acting
+        // player. The starting player is fixed at game start.
+        AbilityCondition::WasStartingPlayer { controller } => {
+            let subject = match controller {
+                ControllerRef::ScopedPlayer => ability.scoped_player.unwrap_or(ability.controller),
+                _ => ability.controller,
+            };
+            state.current_starting_player == subject
+        }
         AbilityCondition::IsMonarch => state.monarch == Some(ability.controller),
         // CR 702.131c: The city's blessing is a player designation that effects
         // can identify.

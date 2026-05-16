@@ -1791,6 +1791,14 @@ fn static_condition_to_trigger_condition(sc: &StaticCondition) -> Option<Trigger
         // CR 702.178a: Speed condition.
         StaticCondition::HasMaxSpeed => Some(TriggerCondition::HasMaxSpeed),
 
+        // CR 103.1: Starting-player status — 1:1 bridge. Radiant Smite's
+        // Cycling trigger reads "if you weren't the starting player".
+        StaticCondition::WasStartingPlayer { controller } => {
+            Some(TriggerCondition::WasStartingPlayer {
+                controller: controller.clone(),
+            })
+        }
+
         // CR 716.2a: Class level condition.
         StaticCondition::ClassLevelGE { level } => {
             Some(TriggerCondition::ClassLevelGE { level: *level })
@@ -1835,6 +1843,12 @@ fn static_condition_to_trigger_condition(sc: &StaticCondition) -> Option<Trigger
             // CR 611.2b: Not(SourceIsTapped) → source is untapped.
             StaticCondition::SourceIsTapped => Some(TriggerCondition::Not {
                 condition: Box::new(TriggerCondition::SourceIsTapped),
+            }),
+            // CR 103.1: "you weren't the starting player" → Not(WasStartingPlayer).
+            StaticCondition::WasStartingPlayer { controller } => Some(TriggerCondition::Not {
+                condition: Box::new(TriggerCondition::WasStartingPlayer {
+                    controller: controller.clone(),
+                }),
             }),
             _ => None,
         },
