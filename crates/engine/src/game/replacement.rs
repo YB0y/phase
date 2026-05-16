@@ -1,5 +1,5 @@
 use indexmap::IndexMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::types::ability::{
     AbilityCost, AbilityDefinition, CombatDamageScope, ControllerRef, DamageModification,
@@ -416,6 +416,13 @@ fn damage_done_applier(
         {
             let prevented_amount;
             let result;
+            // CR 510.2 + CR 615.7: A `Prevention::All` shield encountered during a
+            // simultaneous combat-damage batch defers its prevented-amount
+            // bookkeeping to the post-batch aggregate. While the batch tally is
+            // active, this branch accumulates per-shield and the combat resolver
+            // emits a single `DamagePrevented` + fires the rider once for the
+            // whole batch. `Prevention::Next(N)` keeps the per-event path.
+            let mut accumulated_in_batch = false;
 
             match amount {
                 PreventionAmount::All => {
@@ -433,6 +440,14 @@ fn damage_done_applier(
                     // events in the same turn re-fire the prevention.
                     prevented_amount = dmg;
                     result = ApplyResult::Prevented;
+                    // CR 510.2 + CR 615.7: In a combat-damage batch, route the
+                    // prevented amount into the per-shield aggregate keyed by
+                    // `rid`. The single rider firing happens post-batch in
+                    // `combat_damage.rs` against the summed total.
+                    if let Some(tally) = state.combat_prevention_tally.as_mut() {
+                        *tally.entry(rid).or_insert(0) += prevented_amount as i32;
+                        accumulated_in_batch = true;
+                    }
                 }
                 PreventionAmount::Next(n) => {
                     // CR 615.7: Each 1 damage prevented reduces the remaining shield by 1.
@@ -466,8 +481,13 @@ fn damage_done_applier(
                 }
             }
 
-            // Emit DamagePrevented event for "when damage is prevented" triggers
-            if prevented_amount > 0 {
+            // Emit DamagePrevented event for "when damage is prevented" triggers.
+            // CR 510.2 + CR 615.13: When this prevention was accumulated into the
+            // combat-damage batch tally, the single `DamagePrevented` event and
+            // `last_effect_count` stamp are deferred to the post-batch step in
+            // `combat_damage.rs` — emitting them per-source here would fragment
+            // the rider's `EventContextAmount` across attackers.
+            if prevented_amount > 0 && !accumulated_in_batch {
                 events.push(GameEvent::DamagePrevented {
                     source_id,
                     target,
@@ -3032,8 +3052,22 @@ fn apply_single_replacement(
                 ReplacementBranch::Execute => repl_def.execute.as_deref(),
                 ReplacementBranch::Decline => replacement_mode_decline(&repl_def.mode),
             };
+            // CR 510.2 + CR 615.13: A `Prevention::All` shield firing inside an
+            // active combat-damage batch must NOT stash its rider per-source —
+            // the rider fires once post-batch (`combat_damage.rs`) against the
+            // summed prevented amount. Suppress the per-event stash here so the
+            // batch step owns the single continuation.
+            let batched_combat_all_shield = state.combat_prevention_tally.is_some()
+                && matches!(
+                    repl_def.shield_kind,
+                    ShieldKind::Prevention {
+                        amount: PreventionAmount::All
+                    }
+                );
             let post_effect = match (branch, &repl_def.mode) {
-                (ReplacementBranch::Execute, ReplacementMode::Mandatory) => {
+                (ReplacementBranch::Execute, ReplacementMode::Mandatory)
+                    if !batched_combat_all_shield =>
+                {
                     // CR 615.5: Damage prevention follow-ups (e.g. Phyrexian
                     // Hydra's "Put a -1/-1 counter on ~ for each 1 damage
                     // prevented this way") must always stash as a post-effect
@@ -3252,6 +3286,78 @@ pub fn replace_event(
 ) -> ReplacementResult {
     let registry = build_replacement_registry();
     pipeline_loop(state, proposed, 0, &registry, events)
+}
+
+/// CR 510.2 + CR 615.7 + CR 615.13: Run the replacement pipeline over a whole
+/// simultaneous combat-damage batch.
+///
+/// Each proposed `Damage` event is passed through `replace_event` individually
+/// (the pipeline is inherently per-event), but for the duration of the batch
+/// `state.combat_prevention_tally` is active: the damage-replacement applier's
+/// `Prevention::All` branch routes each prevented amount into a per-shield
+/// aggregate keyed by `ReplacementId` instead of stamping `last_effect_count`
+/// or emitting a per-source `DamagePrevented`. `Prevention::Next(N)` shields
+/// keep the existing per-event sequential path — depletion-style shields are
+/// not aggregated here.
+///
+/// `// strict-failure: CR 615.7 multi-source Next(N) prevention requires a
+/// player choice — out of scope (#314 is Prevention::All)`. When two or more
+/// `Next(N)` shields apply to the same simultaneous batch, CR 615.7 requires
+/// the shielded player to choose which damage each shield prevents; that
+/// player-choice path is not modeled — the shields apply per-event in pipeline
+/// order instead.
+///
+/// Returns a vector aligned 1:1 with `proposed`: `Some(event)` is a survivor
+/// post-replacement `Damage` event for `combat_damage.rs` Phase C to apply;
+/// `None` means that source's damage was fully prevented or skipped. The
+/// `HashMap` is the per-`Prevention::All`-shield aggregate prevented amount.
+pub(crate) fn replace_combat_damage_batch(
+    state: &mut GameState,
+    events: &mut Vec<GameEvent>,
+    proposed: Vec<ProposedEvent>,
+) -> (Vec<Option<ProposedEvent>>, HashMap<ReplacementId, i32>) {
+    let registry = build_replacement_registry();
+
+    // CR 510.2: Activate the batch tally so the applier aggregates per shield.
+    let restore_tally = state.combat_prevention_tally.take();
+    state.combat_prevention_tally = Some(HashMap::new());
+
+    let mut survivors = Vec::with_capacity(proposed.len());
+    for event in proposed {
+        let result = pipeline_loop(state, event, 0, &registry, events);
+        // CR 615.5: A `Prevention::Next(N)` shield's rider is stashed per-event
+        // by the applier (the `Prevention::All` batch path suppresses its stash
+        // and fires once post-batch instead). Resolve any such per-event
+        // continuation inline — for both full prevention (`Prevented`) and
+        // partial prevention (`Modified` → `Execute`) — so a depletion-shield
+        // rider fires "immediately afterward" and never leaks past the batch.
+        if !matches!(result, ReplacementResult::NeedsChoice(_))
+            && state.post_replacement_continuation.is_some()
+        {
+            let _ = crate::game::engine_replacement::apply_pending_post_replacement_effect(
+                state, None, None, events,
+            );
+        }
+        match result {
+            ReplacementResult::Execute(survivor) => survivors.push(Some(survivor)),
+            ReplacementResult::Prevented => {
+                survivors.push(None);
+            }
+            ReplacementResult::NeedsChoice(_) => {
+                // CR 510.2: Combat damage cannot pause for a replacement
+                // ordering choice. Mirror the legacy per-event behavior
+                // (`apply_damage_to_target`'s combat `NeedsChoice` arm) — skip
+                // this source's damage. Clear the pending pause so it does not
+                // leak out of the batch.
+                state.pending_replacement = None;
+                survivors.push(None);
+            }
+        }
+    }
+
+    let tally = state.combat_prevention_tally.take().unwrap_or_default();
+    state.combat_prevention_tally = restore_tally;
+    (survivors, tally)
 }
 
 pub fn continue_replacement(

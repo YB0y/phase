@@ -543,18 +543,43 @@ mod tests {
         let mut events = Vec::new();
         resolve(&mut state, &ability, &mut events).unwrap();
 
-        let ctx = deal_damage::DamageContext::from_source(&state, damage_source).unwrap();
-        let result = deal_damage::apply_damage_to_target(
+        // CR 510.2 + CR 615.13: A `Prevention::All` combat shield's rider fires
+        // once per simultaneous combat-damage batch. Drive the batch primitive
+        // directly (combat damage no longer routes through the per-source
+        // `apply_damage_to_target` inline-rider path).
+        let proposed = crate::types::proposed_event::ProposedEvent::Damage {
+            source_id: damage_source,
+            target: TargetRef::Player(PlayerId(0)),
+            amount: 3,
+            is_combat: true,
+            applied: std::collections::HashSet::new(),
+        };
+        let (survivors, tally) = crate::game::replacement::replace_combat_damage_batch(
             &mut state,
-            &ctx,
-            TargetRef::Player(PlayerId(0)),
-            3,
-            true,
             &mut events,
-        )
-        .unwrap();
+            vec![proposed],
+        );
+        assert_eq!(survivors, vec![None], "all 3 combat damage prevented");
+        // CR 615.7: the shield aggregated 3 prevented damage.
+        let total: i32 = tally.values().sum();
+        assert_eq!(total, 3);
 
-        assert!(matches!(result, deal_damage::DamageResult::Applied(0)));
+        // CR 615.5: fire the rider once against the aggregate prevented amount.
+        let (rid, &prevented) = tally.iter().next().unwrap();
+        let runtime = state.pending_damage_replacements[rid.index]
+            .runtime_execute
+            .clone()
+            .unwrap();
+        state.last_effect_count = Some(prevented);
+        state.post_replacement_continuation =
+            Some(crate::types::ability::PostReplacementContinuation::Resolved(runtime));
+        let _ = crate::game::engine_replacement::apply_pending_post_replacement_effect(
+            &mut state,
+            None,
+            None,
+            &mut events,
+        );
+
         assert_eq!(state.players[0].life, 20);
         let inklings = state
             .objects

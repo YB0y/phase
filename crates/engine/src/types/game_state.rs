@@ -3636,6 +3636,18 @@ pub struct GameState {
     /// CR 725: The initiative designation (like monarch — one player at a time).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initiative: Option<PlayerId>,
+
+    /// CR 510.2 + CR 615.7: Transient per-shield combat-damage prevention tally.
+    /// Set to `Some(empty)` by `apply_combat_damage` for the duration of one
+    /// simultaneous combat-damage batch. While `Some`, the `Prevention::All`
+    /// branch of the damage-replacement applier accumulates each prevented
+    /// amount into this map (keyed by the shield's `ReplacementId`) instead of
+    /// stamping `last_effect_count` per source. After the batch, the combat
+    /// resolver reads the aggregate to fire each shield's `runtime_execute`
+    /// rider exactly once (CR 615.13). Always `None` at every `apply()`
+    /// boundary, so it is excluded from serialization and structural equality.
+    #[serde(skip)]
+    pub combat_prevention_tally: Option<HashMap<ReplacementId, i32>>,
 }
 
 /// A runtime-generated continuous effect stored at state level.
@@ -3953,6 +3965,7 @@ impl GameState {
             ring_bearer: HashMap::new(),
             dungeon_progress: HashMap::new(),
             initiative: None,
+            combat_prevention_tally: None,
             cancelled_casts: Vec::new(),
             pending_activations: Vec::new(),
             commander_declined_zone_return: HashSet::new(),
