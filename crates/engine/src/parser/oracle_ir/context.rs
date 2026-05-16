@@ -41,6 +41,15 @@ pub(crate) struct ParseContext {
     /// `parse_effect_chain_ir` snapshots this into the produced `ClauseIr` and
     /// resets it to `Chosen` for the next chunk so the marker is per-clause.
     pub target_selection_mode: TargetSelectionMode,
+    /// CR 303.4 + CR 702.103: Typed self-reference for the enclosing card's
+    /// attachment host. Set to `Some(TargetFilter::AttachedTo)` only when the
+    /// card being parsed is an Aura or has the Bestow keyword (i.e. it can be
+    /// attached to a permanent). When set, a `"that creature"` anaphor that the
+    /// generic target parser resolves to `ParentTarget` is remapped to this
+    /// host filter — for an Aura/bestow card "that creature" is the enchanted
+    /// host (Springheart Nantuko's landfall copy-token). `None` for non-Aura
+    /// cards, so `ParentTarget` keeps its chosen-target semantics (Twinflame).
+    pub host_self_reference: Option<TargetFilter>,
 }
 
 impl ParseContext {

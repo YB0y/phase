@@ -598,10 +598,67 @@ fn should_resolve_subability_on_optional_decline(ability: &ResolvedAbility) -> b
             condition.as_ref(),
             AbilityCondition::IfYouDo | AbilityCondition::IfAPlayerDoes
         ),
+        // CR 609.3: An `IfYouDo` sub-ability is a valid decline branch when it
+        // carries an alternative for the "you didn't" case — either as an
+        // explicit `else_ability` ("If you do X. Otherwise Y.") OR as a nested
+        // `sub_ability` whose own condition is the `Not`-wrapped performed gate
+        // ("If you do X. If you didn't, Y."). Springheart Nantuko has the
+        // latter shape: `CopyTokenOf {IfYouDo}` → `Token(Insect) {Not(IfYouDo)}`.
+        // Selecting the `IfYouDo` head here lets `resolve_ability_chain`'s
+        // condition-false path descend into the `Not(IfYouDo)` tail so the
+        // Insect token is still created when the optional pay is declined.
         Some(AbilityCondition::IfYouDo | AbilityCondition::IfAPlayerDoes) => {
             ability.else_ability.is_some()
+                || ability.sub_ability.as_ref().is_some_and(|s| {
+                    matches!(
+                        &s.condition,
+                        Some(AbilityCondition::Not { condition })
+                            if matches!(
+                                condition.as_ref(),
+                                AbilityCondition::IfYouDo | AbilityCondition::IfAPlayerDoes
+                            )
+                    )
+                })
         }
-        _ => false,
+        // Every other condition shape: declining the optional effect does not
+        // select a sub-ability branch. Exhaustive — a new `AbilityCondition`
+        // variant must be classified here deliberately, not silently defaulted.
+        None
+        | Some(
+            AbilityCondition::AdditionalCostPaid { .. }
+            | AbilityCondition::AdditionalCostPaidInstead
+            | AbilityCondition::WhenYouDo
+            | AbilityCondition::CastFromZone { .. }
+            | AbilityCondition::CastDuringPhase { .. }
+            | AbilityCondition::CastTimingPermission { .. }
+            | AbilityCondition::ManaColorSpent { .. }
+            | AbilityCondition::RevealedHasCardType { .. }
+            | AbilityCondition::SourceEnteredThisTurn
+            | AbilityCondition::CastVariantPaid { .. }
+            | AbilityCondition::CastVariantPaidInstead { .. }
+            | AbilityCondition::QuantityCheck { .. }
+            | AbilityCondition::PreviousEffectAmount { .. }
+            | AbilityCondition::HasMaxSpeed
+            | AbilityCondition::IsMonarch
+            | AbilityCondition::HasCityBlessing
+            | AbilityCondition::TargetHasKeywordInstead { .. }
+            | AbilityCondition::TargetMatchesFilter { .. }
+            | AbilityCondition::SourceMatchesFilter { .. }
+            | AbilityCondition::ZoneChangeObjectMatchesFilter { .. }
+            | AbilityCondition::ControllerControlsMatching { .. }
+            | AbilityCondition::IsYourTurn
+            | AbilityCondition::FirstCombatPhaseOfTurn
+            | AbilityCondition::ZoneChangedThisWay { .. }
+            | AbilityCondition::CostPaidObjectMatchesFilter { .. }
+            | AbilityCondition::SourceIsTapped
+            | AbilityCondition::ConditionInstead { .. }
+            | AbilityCondition::And { .. }
+            | AbilityCondition::Or { .. }
+            | AbilityCondition::DayNightIsNeither
+            | AbilityCondition::DayNightIs { .. }
+            | AbilityCondition::NthResolutionThisTurn { .. }
+            | AbilityCondition::SourceLacksKeyword { .. },
+        ) => false,
     }
 }
 
@@ -1796,6 +1853,30 @@ pub fn resolve_ability_chain(
                 }
                 else_resolved.context = ability.context.clone();
                 resolve_ability_chain(state, &else_resolved, events, depth + 1)?;
+            } else if let Some(ref sub) = ability.sub_ability {
+                // CR 608.2c + CR 609.3: A skipped `IfYouDo` head whose effect
+                // did not happen must still hand off to a paired `Not(IfYouDo)`
+                // continuation. The head's own condition gates only the head's
+                // effect — the `sub_ability` is the next chain link with its
+                // own condition. Springheart Nantuko's decline path resolves
+                // here: `CopyTokenOf {IfYouDo}` is skipped (no pay → effect not
+                // performed) and the chain descends to `Token(Insect)
+                // {Not(IfYouDo)}`, which evaluates true and creates the Insect.
+                // Restricted to performed-gate sub-conditions so an
+                // unconditional continuation is never run when its parent's
+                // condition failed (that remains an early return).
+                if sub
+                    .condition
+                    .as_ref()
+                    .is_some_and(condition_depends_on_effect_performed)
+                {
+                    let mut sub_resolved = sub.as_ref().clone();
+                    if sub_resolved.targets.is_empty() && !ability.targets.is_empty() {
+                        sub_resolved.targets = ability.targets.clone();
+                    }
+                    sub_resolved.context = ability.context.clone();
+                    resolve_ability_chain(state, &sub_resolved, events, depth + 1)?;
+                }
             }
             return Ok(());
         }

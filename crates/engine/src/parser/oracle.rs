@@ -1042,6 +1042,22 @@ pub(crate) fn parse_oracle_ir(
         ..Default::default()
     };
 
+    // CR 303.4 + CR 702.103: When the card being parsed is an Aura or has the
+    // Bestow keyword, it can be attached to a permanent. A "that creature"
+    // anaphor inside such a card's ability body (e.g. Springheart Nantuko's
+    // landfall "create a token that's a copy of that creature") refers to the
+    // enchanted host, not a chosen target. Expose the typed host self-reference
+    // so the token-copy parser can remap a generic-parser `ParentTarget` to
+    // `TargetFilter::AttachedTo`. Left `None` for non-Aura cards so
+    // `ParentTarget` keeps its chosen-target meaning (Twinflame Strike).
+    if subtypes.iter().any(|s| s.eq_ignore_ascii_case("Aura"))
+        || mtgjson_keyword_names
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case("bestow"))
+    {
+        ctx.host_self_reference = Some(crate::types::ability::TargetFilter::AttachedTo);
+    }
+
     // CR 201.4b: A card's Oracle text uses its name to refer to itself.
     // Normalize self-references to `~` once, at the single parser entry point,
     // so every downstream block parser (saga, class, leveler, modal, trigger,

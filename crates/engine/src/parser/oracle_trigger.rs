@@ -528,6 +528,12 @@ pub(crate) fn parse_trigger_line_with_index_ir(
         subject: Some(trigger_subject.clone()),
         card_name: Some(card_name.to_string()),
         current_trigger_index,
+        // CR 303.4 + CR 702.103: Propagate the enclosing card's typed host
+        // self-reference (set by `parse_oracle_ir` for Aura/bestow cards) into
+        // the per-trigger effect context. The trigger body's effect parser
+        // needs it to remap a `"that creature"` copy-token anaphor to the
+        // enchanted host (Springheart Nantuko's landfall trigger).
+        host_self_reference: ctx.host_self_reference.clone(),
         ..Default::default()
     };
 

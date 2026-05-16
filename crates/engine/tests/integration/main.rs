@@ -33,6 +33,7 @@ mod oracle_parser;
 mod riot_control_regression;
 mod ripples_of_undeath_regression;
 mod rules;
+mod springheart_nantuko_bestow_landfall;
 mod swans_prevention_followup;
 mod tempt_with_discovery;
 mod timely_ward_regression;

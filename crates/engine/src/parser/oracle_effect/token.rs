@@ -80,6 +80,21 @@ pub(super) fn try_parse_token(_lower: &str, text: &str, ctx: &mut ParseContext) 
                 }
             }
         }
+        // CR 303.4 + CR 702.103: Inside an Aura/bestow card, a `"that creature"`
+        // anaphor in the copy-token clause is the antecedent of the attachment
+        // host ("a creature you control") in the enclosing condition — not a
+        // chosen target. The generic `parse_target` family returns
+        // `TargetFilter::ParentTarget` for "that creature" because attachment
+        // context is not threaded through the effect parser. When the parse
+        // context exposes a typed host self-reference (`host_self_reference`,
+        // set by `parse_oracle_ir` only for Aura/bestow cards), remap a
+        // `ParentTarget` copy target to the host filter so the runtime resolves
+        // the copy against the enchanted creature. Non-Aura cards leave
+        // `host_self_reference` `None`, so `ParentTarget` keeps its
+        // chosen-target meaning (Twinflame Strike's "for each of them").
+        if let (TargetFilter::ParentTarget, Some(host)) = (&target, &ctx.host_self_reference) {
+            target = host.clone();
+        }
         return Some(Effect::CopyTokenOf {
             target,
             source_filter: None,
@@ -914,6 +929,46 @@ mod tests {
         };
         assert_eq!(target, TargetFilter::CostPaidObject);
         assert_eq!(count, QuantityExpr::Fixed { value: 2 });
+    }
+
+    #[test]
+    fn copy_token_of_that_creature_remaps_to_attached_to_for_aura_card() {
+        // CR 303.4 + CR 702.103: Inside an Aura/bestow card (Springheart
+        // Nantuko), `host_self_reference` is set to `AttachedTo`. The
+        // "that creature" anaphor in "create a token that's a copy of that
+        // creature" must remap from `ParentTarget` to `AttachedTo` — "that
+        // creature" is the enchanted host.
+        let mut ctx = ParseContext {
+            host_self_reference: Some(TargetFilter::AttachedTo),
+            ..ParseContext::default()
+        };
+        let effect = try_parse_token(
+            "create a token that's a copy of that creature",
+            "Create a token that's a copy of that creature",
+            &mut ctx,
+        )
+        .expect("expected CopyTokenOf");
+        let Effect::CopyTokenOf { target, .. } = effect else {
+            panic!("expected CopyTokenOf, got {effect:?}");
+        };
+        assert_eq!(target, TargetFilter::AttachedTo);
+    }
+
+    #[test]
+    fn copy_token_of_that_creature_keeps_parent_target_for_non_aura_card() {
+        // Twinflame Strike class: a non-Aura card leaves `host_self_reference`
+        // `None`, so the "that creature" anaphor keeps its `ParentTarget`
+        // chosen-target semantics. The Aura-only remap must not corrupt it.
+        let effect = try_parse_token(
+            "create a token that's a copy of that creature",
+            "Create a token that's a copy of that creature",
+            &mut ParseContext::default(),
+        )
+        .expect("expected CopyTokenOf");
+        let Effect::CopyTokenOf { target, .. } = effect else {
+            panic!("expected CopyTokenOf, got {effect:?}");
+        };
+        assert_eq!(target, TargetFilter::ParentTarget);
     }
 
     #[test]

@@ -103,14 +103,27 @@ pub fn resolve(
         // `effects::mod.rs::resolve_ability_chain` (issue #323 class).
         let effective_targets =
             crate::game::targeting::resolved_targets(ability, target_filter, state);
-        let ids = crate::game::effects::effect_object_targets(target_filter, &effective_targets);
-        if ids.is_empty() {
-            return Err(EffectError::MissingParam(
-                "CopyTokenOf requires a target".to_string(),
-            ));
-        }
-        ids
+        crate::game::effects::effect_object_targets(target_filter, &effective_targets)
     };
+
+    // CR 609.3 + CR 101.3: "Do as much as possible" — when the copy source
+    // resolves empty, `CopyTokenOf` is a clean zero-token no-op rather than an
+    // error. This is required for an unattached Springheart Nantuko: its
+    // `target: AttachedTo` host resolves empty when the card is not bestowed
+    // onto a creature, so the copy makes nothing and the chained
+    // `Not(IfYouDo)` Insect-token fallback can still fire. `EffectResolved` is
+    // still emitted so the chain treats the effect as resolved.
+    if copy_source_ids.is_empty() {
+        // CR 603.7 + CR 701.36a: No tokens created — clear the per-resolution
+        // ledger so a downstream "the token created this way" anaphor does not
+        // pick up a stale id from an earlier resolution.
+        state.last_created_token_ids = Vec::new();
+        events.push(GameEvent::EffectResolved {
+            kind: EffectKind::from(&ability.effect),
+            source_id: ability.source_id,
+        });
+        return Ok(());
+    }
 
     // CR 707.10 + CR 115.1d: Create `count` independent copy-tokens per copy
     // source. Each is snapshotted from the source values so that subsequent
@@ -539,6 +552,57 @@ mod tests {
         assert_eq!(token.power, Some(2));
         assert_eq!(token.toughness, Some(2));
         assert!(token.is_token);
+    }
+
+    /// CR 609.3 + CR 101.3: An unattached Springheart Nantuko resolves
+    /// `CopyTokenOf { target: AttachedTo }` with no host — `AttachedTo`
+    /// resolves empty. The effect must be a clean zero-token no-op (no token
+    /// created, `Ok` not `Err`) so the chained Insect-token fallback can fire.
+    #[test]
+    fn copy_token_of_empty_host_is_clean_no_op() {
+        let mut state = GameState::new_two_player(42);
+        // Source object with no `attached_to` — `AttachedTo` resolves empty.
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Springheart Nantuko".to_string(),
+            Zone::Battlefield,
+        );
+        let objects_before = state.objects.len();
+
+        let ability = ResolvedAbility::new(
+            Effect::CopyTokenOf {
+                target: TargetFilter::AttachedTo,
+                source_filter: None,
+                enters_attacking: false,
+                tapped: false,
+                count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+                extra_keywords: vec![],
+                additional_modifications: vec![],
+            },
+            vec![],
+            source_id,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).expect("empty host must be a clean no-op");
+
+        assert_eq!(
+            state.objects.len(),
+            objects_before,
+            "no token may be created when the AttachedTo host is empty"
+        );
+        assert!(
+            state.last_created_token_ids.is_empty(),
+            "no token ids recorded for an empty-host no-op"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, GameEvent::EffectResolved { .. })),
+            "EffectResolved must still be emitted so the chain proceeds"
+        );
     }
 
     #[test]

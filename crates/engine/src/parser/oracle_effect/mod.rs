@@ -5709,6 +5709,10 @@ fn try_split_targeted_compound(text: &str, ctx: &mut ParseContext) -> Option<Par
     let mut continuation_ctx = if uses_parent_target_reference {
         ParseContext {
             card_name: ctx.card_name.clone(),
+            // CR 303.4 + CR 702.103: keep the enclosing card's typed host
+            // self-reference so a `"that creature"` copy-token anaphor in the
+            // continuation chunk still remaps to the enchanted host.
+            host_self_reference: ctx.host_self_reference.clone(),
             ..Default::default()
         }
     } else {
@@ -10002,6 +10006,10 @@ pub(crate) fn parse_effect_chain_ir(
                 .relative_player_scope
                 .clone()
                 .or_else(|| player_scope.map(|_| ControllerRef::ScopedPlayer)),
+            // CR 303.4 + CR 702.103: propagate the enclosing card's typed host
+            // self-reference so a `"that creature"` copy-token anaphor in any
+            // chunk of an Aura/bestow card remaps to the enchanted host.
+            host_self_reference: ctx.host_self_reference.clone(),
             ..Default::default()
         };
         let ctx = &mut chunk_ctx;
