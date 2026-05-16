@@ -551,6 +551,16 @@ pub(super) fn resolve_optional_effect_decision(
         AutoMayChoice::Accept => {
             ability.context.optional_effect_performed = true;
             resolve_ability_chain(state, &ability, events, depth)?;
+            // CR 608.2c: When an optional effect's prompt suspended the parent
+            // chain, the "If you do" sibling continuation was stashed BEFORE the
+            // player chose — so its context still carries
+            // `optional_effect_performed = false`. Now that the effect has been
+            // performed, propagate the signal into the stashed continuation so
+            // its `IfYouDo` gate evaluates true (e.g. Ral, Monsoon Mage:
+            // "you may exile Ral. If you do, return him transformed").
+            if let Some(cont) = state.pending_continuation.as_mut() {
+                cont.chain.set_optional_effect_performed_recursive(true);
+            }
         }
         AutoMayChoice::Decline => {
             let decline_branch = ability.else_ability.as_ref().or_else(|| {
@@ -567,6 +577,19 @@ pub(super) fn resolve_optional_effect_decision(
         }
     }
     Ok(())
+}
+
+/// CR 608.2c: Whether a sub-ability condition is a "was the effect performed"
+/// gate (`IfYouDo` / `IfAPlayerDoes`, including a `Not`-wrapped form). Such
+/// conditions cannot be evaluated while the parent effect is suspended for a
+/// player choice — the answer is not yet known — so the sub-ability must be
+/// deferred as a continuation rather than gated eagerly.
+fn condition_depends_on_effect_performed(condition: &AbilityCondition) -> bool {
+    match condition {
+        AbilityCondition::IfYouDo | AbilityCondition::IfAPlayerDoes => true,
+        AbilityCondition::Not { condition } => condition_depends_on_effect_performed(condition),
+        _ => false,
+    }
 }
 
 fn should_resolve_subability_on_optional_decline(ability: &ResolvedAbility) -> bool {
@@ -2225,6 +2248,28 @@ pub fn resolve_ability_chain(
                         resolve_ability_chain(state, &resolved, events, depth + 1)?;
                     }
                 }
+                return Ok(());
+            }
+
+            // CR 608.2c: When the parent effect suspended for a player choice
+            // (e.g. an optional "you may" prompt), an `IfYouDo` / `IfAPlayerDoes`
+            // gate cannot yet be evaluated — whether the effect was performed is
+            // not decided. Eagerly evaluating it here would read a stale
+            // `optional_effect_performed = false` and silently drop the
+            // conditional sub-ability (Ral, Monsoon Mage: "you may exile Ral.
+            // If you do, return him transformed"). Defer instead: stash the sub
+            // WITH its condition so `resolve_ability_chain`'s top-level
+            // condition check (CR 608.2c) re-evaluates it once the choice
+            // resolves and the flag is correct.
+            if waits_for_resolution_choice(&state.waiting_for)
+                && condition_depends_on_effect_performed(condition)
+            {
+                let mut sub_clone = sub.as_ref().clone();
+                if sub_clone.targets.is_empty() && !ability.targets.is_empty() {
+                    sub_clone.targets = ability.targets.clone();
+                }
+                apply_parent_chain_context(&mut sub_clone, ability, effect_context_object.as_ref());
+                prepend_to_pending_continuation(state, sub_clone);
                 return Ok(());
             }
 
