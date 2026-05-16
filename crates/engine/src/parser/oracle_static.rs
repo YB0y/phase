@@ -2761,6 +2761,14 @@ fn parse_typed_you_control(text: &str, lower: &str, is_other: bool) -> Option<St
                             .controller(ControllerRef::You)
                             .properties(vec![FilterProp::IsCommander]),
                     )
+                // CR 111.1 / CR 205.3: A `non`/`non-` negation descriptor
+                // ("Nontoken creatures you control") is a type/token-identity
+                // negation, NOT a subtype. Bail so dispatch falls through to
+                // `parse_subject_additive_type_static`, which routes the
+                // subject through `parse_type_phrase` and yields the correct
+                // `FilterProp::NonToken`.
+                } else if descriptor_is_negation(descriptor) {
+                    return None;
                 } else if is_capitalized_words(descriptor) {
                     TargetFilter::Typed(
                         typed_filter_for_subtype(descriptor).controller(ControllerRef::You),
@@ -2780,6 +2788,10 @@ fn parse_typed_you_control(text: &str, lower: &str, is_other: bool) -> Option<St
                             p
                         }),
                 )
+            } else if descriptor_is_negation(desc_remaining) {
+                // CR 111.1 / CR 205.3: negation descriptor after a combat-status
+                // prefix — not a subtype; fall through to additive-type dispatch.
+                return None;
             } else if is_capitalized_words(desc_remaining) {
                 // Combat-status prefix found + remaining is a subtype
                 TargetFilter::Typed(
@@ -5023,6 +5035,34 @@ fn parse_commander_subject_filter(subject: &str) -> Option<TargetFilter> {
     Some(TargetFilter::Typed(typed))
 }
 
+/// CR 205.1a / CR 205.3 / CR 111.1: Returns true when `descriptor` is a
+/// `non`/`non-` negation adjective (e.g. "Nontoken", "Nonland", "noncreature").
+/// The negation targets a card type (CR 205.1a), a subtype (CR 205.3), or
+/// token object identity (CR 111.1) — never a supertype.
+///
+/// Subject-filter parsers strip the trailing `" creatures"` to obtain a bare
+/// descriptor and then route capitalized descriptors through a
+/// `subtype`-fabricating fallback. A sentence-leading "Nontoken" is
+/// capitalized but is NOT a subtype — it is a type/token-identity negation.
+/// This guard lets such descriptors fall through to `parse_type_phrase`, whose
+/// negation loop maps the negated word to `FilterProp`/`TypeFilter::Non` via
+/// `classify_negation` (the single authority).
+///
+/// The detection is made by *trying the nom negation tag* — never `==` /
+/// `contains` — and is word-boundary-anchored: the guard fires only when
+/// `non`/`non-` is the genuine head of a complete negation descriptor token
+/// (a non-empty negated word follows the prefix), so it cannot match the
+/// prefix of an unrelated subtype word.
+fn descriptor_is_negation(descriptor: &str) -> bool {
+    let lower = descriptor.to_lowercase();
+    let Ok((after_non, _)) =
+        alt((tag::<_, _, OracleError<'_>>("non-"), tag("non"))).parse(lower.as_str())
+    else {
+        return false;
+    };
+    after_non.chars().next().is_some_and(|c| !c.is_whitespace())
+}
+
 fn parse_creature_subject_filter(subject: &str) -> Option<TargetFilter> {
     let trimmed = subject.trim();
     let lower = trimmed.to_lowercase();
@@ -5080,6 +5120,17 @@ fn parse_creature_subject_filter(subject: &str) -> Option<TargetFilter> {
             typed.properties.push(FilterProp::Another);
         }
         return Some(TargetFilter::Typed(typed));
+    }
+
+    // CR 111.1 / CR 205.3: A `non`/`non-` negation descriptor (e.g. "Nontoken
+    // creatures") is a type phrase with a token-identity / type negation, NOT a
+    // subtype. `is_capitalized_words` below would otherwise fabricate a bogus
+    // `Subtype("Nontoken")` for a sentence-leading capitalized "Nontoken". Bail
+    // so `parse_continuous_subject_filter` falls through to its own
+    // `parse_type_phrase` call, whose negation loop maps `nontoken` →
+    // `FilterProp::NonToken` via `classify_negation`.
+    if descriptor_is_negation(descriptor) {
+        return None;
     }
 
     if is_capitalized_words(descriptor) {
@@ -12859,6 +12910,122 @@ mod tests {
             assert_eq!(tf.get_subtype(), Some("Wolf"));
         } else {
             panic!("Expected Typed filter with Wolf subtype, got {:?}", filter);
+        }
+    }
+
+    #[test]
+    fn continuous_subject_filter_nontoken_is_negation_not_subtype() {
+        // CR 111.1 / CR 205.3: "Nontoken creatures you control" (Ashaya, Soul of
+        // the Wild) is a type phrase with a token-identity negation, NOT a
+        // subtype. The negation guard in `parse_creature_subject_filter` must
+        // return None so the phrase falls through to `parse_type_phrase`, which
+        // produces a `Creature` filter with the `NonToken` property.
+        let filter = super::parse_continuous_subject_filter("Nontoken creatures you control")
+            .expect("nontoken creature subject should parse");
+        let TargetFilter::Typed(tf) = &filter else {
+            panic!("Expected Typed filter, got {:?}", filter);
+        };
+        assert!(
+            tf.get_subtype().is_none(),
+            "must NOT fabricate a subtype, got {:?}",
+            tf.get_subtype()
+        );
+        assert!(
+            tf.type_filters.contains(&TypeFilter::Creature),
+            "expected Creature type filter, got {:?}",
+            tf.type_filters
+        );
+        assert!(
+            tf.properties.contains(&FilterProp::NonToken),
+            "expected NonToken property, got {:?}",
+            tf.properties
+        );
+        assert_eq!(tf.controller, Some(ControllerRef::You));
+    }
+
+    #[test]
+    fn continuous_subject_filter_capitalized_subtype_still_works() {
+        // Negative control: a genuine capitalized subtype descriptor must still
+        // route through the `is_capitalized_words` path — the negation guard
+        // must not fire on an ordinary subtype that happens to start with a
+        // capital. "Angel" does not begin with the `non` negation prefix.
+        let filter = super::parse_continuous_subject_filter("Angel creatures you control")
+            .expect("Angel creature subject should parse");
+        let TargetFilter::Typed(tf) = &filter else {
+            panic!("Expected Typed filter, got {:?}", filter);
+        };
+        assert_eq!(tf.get_subtype(), Some("Angel"));
+        assert_eq!(tf.controller, Some(ControllerRef::You));
+    }
+
+    #[test]
+    fn continuous_subject_filter_noncreature_word_boundary_anchor() {
+        // Word-boundary anchor check: the `non` guard fires for genuine negation
+        // descriptors ("Nonland creatures"), and the negated word reaches
+        // `classify_negation` via `parse_type_phrase`. This confirms the guard
+        // is not over-broad — it only fires when `non` heads a real descriptor
+        // token, which is always true for a `parse_creature_subject_filter`
+        // descriptor extracted by stripping " creatures".
+        let filter = super::parse_continuous_subject_filter("Nonland creatures you control")
+            .expect("nonland creature subject should parse");
+        let TargetFilter::Typed(tf) = &filter else {
+            panic!("Expected Typed filter, got {:?}", filter);
+        };
+        assert!(
+            tf.get_subtype().is_none(),
+            "must NOT fabricate a subtype, got {:?}",
+            tf.get_subtype()
+        );
+        assert!(
+            tf.type_filters
+                .iter()
+                .any(|t| matches!(t, TypeFilter::Non(_))),
+            "expected a negated type filter, got {:?}",
+            tf.type_filters
+        );
+    }
+
+    #[test]
+    fn static_pump_line_nontoken_subject_routes_through_negation_guard() {
+        // CR 111.1 / CR 205.3: A pump/keyword static whose subject is a `non`
+        // negation descriptor ("Nontoken creatures you control get/have ...")
+        // must NOT fabricate a `Subtype("Nontoken")`. This exercises the
+        // `parse_typed_you_control` negation guard (`:2764`/`:2783`): the guard
+        // returns None, dispatch falls through, and `parse_type_phrase`'s
+        // negation loop yields the correct `Creature` + `NonToken` filter.
+        for line in [
+            "Nontoken creatures you control get +1/+1.",
+            "Nontoken creatures you control have flying.",
+        ] {
+            let def = parse_static_line(line)
+                .unwrap_or_else(|| panic!("static line should parse: {line:?}"));
+            assert_eq!(def.mode, StaticMode::Continuous);
+            let Some(TargetFilter::Typed(tf)) = &def.affected else {
+                panic!(
+                    "Expected Typed affected filter for {line:?}, got {:?}",
+                    def.affected
+                );
+            };
+            assert!(
+                tf.get_subtype().is_none(),
+                "{line:?}: must NOT fabricate a subtype, got {:?}",
+                tf.get_subtype()
+            );
+            assert!(
+                tf.type_filters.contains(&TypeFilter::Creature),
+                "{line:?}: expected Creature type filter, got {:?}",
+                tf.type_filters
+            );
+            assert!(
+                tf.properties.contains(&FilterProp::NonToken),
+                "{line:?}: expected NonToken property, got {:?}",
+                tf.properties
+            );
+            assert_eq!(
+                tf.controller,
+                Some(ControllerRef::You),
+                "{line:?}: expected controller You"
+            );
         }
     }
 

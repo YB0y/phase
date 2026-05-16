@@ -1,6 +1,7 @@
 mod abigale_integration;
 mod adapter_contract_fixtures;
 mod advanced_reconstruction_regression;
+mod ashaya_nontoken_lands;
 mod aura_on_player;
 mod betor_lifelink_counters_repro;
 mod brigid_mana_ability;
