@@ -538,9 +538,19 @@ pub(super) fn resolve_tap_mana_triggers_inline(
     }
 }
 
-/// Process events and place triggered abilities on the stack in APNAP order.
-/// CR 603.3b: Process triggered abilities waiting to be put on the stack.
-pub fn process_triggers(state: &mut GameState, events: &[GameEvent]) {
+/// CR 603.2 + CR 603.3b: Collect every triggered ability matching `events`,
+/// apply trigger doubling, and return the contexts sorted into APNAP dispatch
+/// order (NAP first / bottom of stack, AP last / top). This is the pure
+/// *collection* half of trigger processing — it never touches
+/// `state.pending_trigger` or `state.waiting_for` and never pushes to the
+/// stack. `process_triggers` composes this with `dispatch_pending_trigger_context`
+/// for the standard path; `collect_triggers_into_deferred` composes it with the
+/// `deferred_triggers` queue for resolution-choice handlers that must collect
+/// without dispatching (issue #423).
+fn collect_pending_triggers(
+    state: &mut GameState,
+    events: &[GameEvent],
+) -> Vec<PendingTriggerContext> {
     // CR 603.6a + CR 611.2e: Continuous effects (including statics that grant
     // triggered abilities to a class — sliver-lord pattern) apply the moment
     // the affected permanent is on the battlefield. The newcomers must be
@@ -583,7 +593,7 @@ pub fn process_triggers(state: &mut GameState, events: &[GameEvent]) {
                 has_prowess,
                 has_exploit,
                 has_ravenous,
-                firebending_n,
+                firebending_amount,
                 ward_costs,
                 has_decayed,
                 matched_triggers,
@@ -592,9 +602,9 @@ pub fn process_triggers(state: &mut GameState, events: &[GameEvent]) {
                     Some(o) => o,
                     None => continue,
                 };
-                let fb_n = obj.keywords.iter().find_map(|k| {
-                    if let Keyword::Firebending(n) = k {
-                        Some(*n)
+                let fb_amount = obj.keywords.iter().find_map(|k| {
+                    if let Keyword::Firebending(amount) = k {
+                        Some(amount.clone())
                     } else {
                         None
                     }
@@ -622,7 +632,7 @@ pub fn process_triggers(state: &mut GameState, events: &[GameEvent]) {
                     matches!(event, GameEvent::ZoneChanged { .. })
                         && obj.has_keyword(&Keyword::Exploit),
                     obj.has_keyword(&Keyword::Ravenous),
-                    fb_n,
+                    fb_amount,
                     wards,
                     obj.has_keyword(&Keyword::Decayed),
                     collect_matching_triggers(
@@ -744,11 +754,12 @@ pub fn process_triggers(state: &mut GameState, events: &[GameEvent]) {
             // Firebending N triggers when a creature with firebending is declared as attacker.
             // Produces N {R} mana with EndOfCombat expiry.
             if let GameEvent::AttackersDeclared { attacker_ids, .. } = event {
-                if let Some(n) = firebending_n {
-                    if attacker_ids.contains(&obj_id) && n > 0 {
+                if let Some(amount) = firebending_amount {
+                    if attacker_ids.contains(&obj_id) {
                         let fb_effect = Effect::Mana {
-                            produced: crate::types::ability::ManaProduction::Fixed {
-                                colors: vec![crate::types::mana::ManaColor::Red; n as usize],
+                            produced: crate::types::ability::ManaProduction::AnyOneColor {
+                                count: amount,
+                                color_options: vec![crate::types::mana::ManaColor::Red],
                                 contribution: crate::types::ability::ManaContribution::Base,
                             },
                             restrictions: vec![],
@@ -759,7 +770,7 @@ pub fn process_triggers(state: &mut GameState, events: &[GameEvent]) {
                         let fb_ability =
                             ResolvedAbility::new(fb_effect, Vec::new(), obj_id, controller);
                         let fb_trig_def = TriggerDefinition::new(TriggerMode::Firebend)
-                            .description(format!("Firebending {n}"));
+                            .description("Firebending".to_string());
                         pending.push(PendingTriggerContext::single(PendingTrigger {
                             source_id: obj_id,
                             controller,
@@ -772,15 +783,10 @@ pub fn process_triggers(state: &mut GameState, events: &[GameEvent]) {
                             modal: None,
                             mode_abilities: vec![],
                             description: fb_trig_def.description,
-                            may_trigger_origin: None,
+                            may_trigger_origin: Some(MayTriggerOrigin::Keyword {
+                                keyword: KeywordKind::Firebending,
+                            }),
                         }));
-                        // Track bending type for Avatar Aang's "if you've done all four"
-                        if let Some(player) = state.players.iter_mut().find(|p| p.id == controller)
-                        {
-                            player
-                                .bending_types_this_turn
-                                .insert(crate::types::events::BendingType::Fire);
-                        }
                     }
                 }
             }
@@ -1455,10 +1461,6 @@ pub fn process_triggers(state: &mut GameState, events: &[GameEvent]) {
     // then clone matching pending triggers.
     apply_trigger_doubling(state, &mut pending);
 
-    if pending.is_empty() {
-        return;
-    }
-
     // CR 603.3b: Active player's triggers are ordered before non-active player's triggers.
     // Within same controller, order by timestamp.
     pending.sort_by_key(|t| {
@@ -1473,6 +1475,23 @@ pub fn process_triggers(state: &mut GameState, events: &[GameEvent]) {
     // Reverse so NAP triggers are placed first (bottom of stack), AP triggers last (top).
     // CR 603.3b: LIFO means AP triggers resolve last (APNAP ordering).
     pending.reverse();
+
+    pending
+}
+
+/// Process events and place triggered abilities on the stack in APNAP order.
+/// CR 603.3b: Process triggered abilities waiting to be put on the stack.
+pub fn process_triggers(state: &mut GameState, events: &[GameEvent]) {
+    let pending = collect_pending_triggers(state, events);
+
+    // CR 603.2 / CR 603.3: Nothing triggered — short-circuit before the
+    // transient-field cleanup below. This early return is load-bearing: the
+    // cleanup must run *only* when triggers were actually collected, so that
+    // `process_triggers` is a no-op (byte-identical) for events that trigger
+    // nothing. Callers rely on this (e.g. mana-tap event scans).
+    if pending.is_empty() {
+        return;
+    }
 
     // CR 113.2c + CR 603.2 + CR 603.3b: Drive each collected trigger through
     // its disposition (pushed to stack, resolved inline as a mana ability, or
@@ -1517,6 +1536,25 @@ pub fn process_triggers(state: &mut GameState, events: &[GameEvent]) {
         obj.mana_spent_to_cast = false;
         obj.colors_spent_to_cast = crate::types::mana::ColoredManaCount::default();
     }
+}
+
+/// CR 603.2 + CR 603.3b: Collect triggers matching `events` and enqueue them
+/// into `state.deferred_triggers` *without dispatching* — never touches
+/// `state.pending_trigger` or `state.waiting_for`, never pushes to the stack.
+///
+/// This is the collect-only counterpart to `process_triggers`, used by
+/// resolution-choice handlers (`engine_resolution_choices.rs`) that move a
+/// permanent to the graveyard inside the handler (e.g. `Effect::Sacrifice`).
+/// In that flow `waiting_for` is not `Priority`, so `run_post_action_pipeline`
+/// cannot run `process_triggers` for the sacrifice events; the resulting
+/// dies-triggers (Undying, Blood Artist) would otherwise be lost (issue #423).
+/// Batching them into `deferred_triggers` lets the handler dispatch them
+/// itself via `drain_deferred_trigger_queue` once its reflexive continuation
+/// has resolved, or lets `finalize_trigger_target_selection` drain them later
+/// if the continuation paused on a target.
+pub(crate) fn collect_triggers_into_deferred(state: &mut GameState, events: &[GameEvent]) {
+    let pending = collect_pending_triggers(state, events);
+    state.deferred_triggers.extend(pending);
 }
 
 /// CR 603.3: Put triggered ability on the stack.
@@ -3761,6 +3799,67 @@ pub mod tests {
                 keyword: KeywordKind::Exploit,
             })
         );
+    }
+
+    #[test]
+    fn firebending_trigger_resolves_dynamic_amount_at_mana_resolution() {
+        let mut state = setup();
+        let player = PlayerId(0);
+        let firebender = create_object(
+            &mut state,
+            CardId(1),
+            player,
+            "Firebender".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&firebender).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.power = Some(2);
+            obj.keywords.push(Keyword::Firebending(QuantityExpr::Ref {
+                qty: crate::types::ability::QuantityRef::Power {
+                    scope: crate::types::ability::ObjectScope::Source,
+                },
+            }));
+        }
+
+        process_triggers(
+            &mut state,
+            &[GameEvent::AttackersDeclared {
+                attacker_ids: vec![firebender],
+                defending_player: PlayerId(1),
+                attacks: vec![(
+                    firebender,
+                    crate::game::combat::AttackTarget::Player(PlayerId(1)),
+                )],
+            }],
+        );
+
+        let Some(StackEntryKind::TriggeredAbility { ability, .. }) =
+            state.stack.back().map(|entry| &entry.kind)
+        else {
+            panic!("expected firebending trigger on stack");
+        };
+        let ability = ability.clone();
+        assert_eq!(
+            ability.may_trigger_origin,
+            Some(MayTriggerOrigin::Keyword {
+                keyword: KeywordKind::Firebending,
+            })
+        );
+        state.objects.get_mut(&firebender).unwrap().power = Some(5);
+        let mut events = Vec::new();
+
+        crate::game::effects::resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+
+        assert_eq!(state.players[0].mana_pool.count_color(ManaType::Red), 5);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GameEvent::Firebend {
+                source_id,
+                controller: PlayerId(0)
+            } if *source_id == firebender
+        )));
     }
 
     #[test]
@@ -10636,6 +10735,563 @@ pub mod tests {
                 break;
             }
         }
+    }
+    // -----------------------------------------------------------------------
+    // Issue #423: dies-triggers (Undying, Blood Artist-class) must not be lost
+    // when a creature is sacrificed inside a resolution-choice handler.
+    // -----------------------------------------------------------------------
+
+    /// Create an inert battlefield artifact to host a triggered ability in the
+    /// #423 tests. Using a non-creature source keeps a reflexive `Destroy
+    /// SelfRef` from producing a creature-dies event that would muddy
+    /// observer-trigger assertions.
+    fn make_artifact_source(state: &mut GameState, player: PlayerId, name: &str) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(state.next_object_id),
+            player,
+            name.to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Artifact);
+        obj.base_card_types = obj.card_types.clone();
+        id
+    }
+
+    /// Install the synthesized Undying dies-trigger (CR 702.93a) onto a
+    /// battlefield creature, mirroring `make_soulbond_creature`.
+    fn make_undying_creature(state: &mut GameState, player: PlayerId, name: &str) -> ObjectId {
+        let id = make_creature(state, player, name, 2, 2);
+        let triggers =
+            crate::database::synthesis::KeywordTriggerInstaller::triggers_for(&Keyword::Undying);
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.keywords.push(Keyword::Undying);
+        obj.base_keywords.push(Keyword::Undying);
+        for trigger in &triggers {
+            obj.trigger_definitions.push(trigger.clone());
+        }
+        std::sync::Arc::make_mut(&mut obj.base_trigger_definitions).extend(triggers);
+        id
+    }
+
+    /// Build a Grist-style ability: `Effect::Sacrifice` of a creature you
+    /// control (`count: 1`, routes through `EffectZoneChoice` when more than
+    /// one creature is eligible) plus a reflexive `WhenYouDo` sub-ability
+    /// carrying `reflexive_effect`. Pick a reflexive effect that resolves
+    /// inline (e.g. `Destroy SelfRef`, B1) or one that itself raises a
+    /// resolution choice (e.g. `Sacrifice` of an opponent's permanents, B2).
+    fn sacrifice_then_when_you_do(reflexive_effect: Effect) -> AbilityDefinition {
+        let reflexive = AbilityDefinition::new(AbilityKind::Spell, reflexive_effect)
+            .condition(AbilityCondition::WhenYouDo);
+        AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Sacrifice {
+                target: TargetFilter::Typed(
+                    TypedFilter::default()
+                        .with_type(TypeFilter::Creature)
+                        .controller(ControllerRef::You),
+                ),
+                count: QuantityExpr::Fixed { value: 1 },
+                min_count: 0,
+            },
+        )
+        .sub_ability(reflexive)
+    }
+
+    /// A reflexive `Destroy SelfRef` effect — resolves inline when resumed as a
+    /// continuation (no target selection), so the sacrifice's B1 path is taken.
+    fn reflexive_destroy_self() -> Effect {
+        Effect::Destroy {
+            target: TargetFilter::SelfRef,
+            cant_regenerate: false,
+        }
+    }
+
+    /// A reflexive `Sacrifice` of one creature an opponent controls. When the
+    /// opponent controls more than one creature this raises a fresh
+    /// `EffectZoneChoice` on resume — a deterministic B2 pause.
+    fn reflexive_opponent_sacrifice() -> Effect {
+        Effect::Sacrifice {
+            target: TargetFilter::Typed(
+                TypedFilter::default()
+                    .with_type(TypeFilter::Creature)
+                    .controller(ControllerRef::Opponent),
+            ),
+            count: QuantityExpr::Fixed { value: 1 },
+            min_count: 0,
+        }
+    }
+
+    /// Push `ability` onto the stack as a triggered ability controlled by
+    /// `controller`, then pass priority until the resolution pauses on a
+    /// `WaitingFor` other than `Priority` (or the stack empties). Returns the
+    /// collected events.
+    fn resolve_stack_until_paused(state: &mut GameState) -> Vec<GameEvent> {
+        let mut all = Vec::new();
+        for _ in 0..30 {
+            if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+                return all;
+            }
+            if state.stack.is_empty() {
+                return all;
+            }
+            let result = crate::game::engine::apply_as_current(state, GameAction::PassPriority)
+                .expect("pass priority");
+            all.extend(result.events);
+        }
+        panic!("stack did not settle: waiting_for={:?}", state.waiting_for);
+    }
+
+    /// CR 702.93a + issue #423 (4a, B1 baseline): an Undying creature with zero
+    /// +1/+1 counters sacrificed inside the `EffectZoneChoice` resolution
+    /// handler must still fire its dies-trigger and return to the battlefield
+    /// with one +1/+1 counter. The reflexive `WhenYouDo Destroy` targets
+    /// `SelfRef` and so resolves inline (B1: `waiting_for` stays `Priority`);
+    /// `run_post_action_pipeline`'s standard trigger scan fires Undying. This
+    /// is the happy-path regression guard — the discriminating B2 case (where
+    /// the standard scan never runs) is `issue_423_co_triggered_targeted_
+    /// observer_reaches_stack`.
+    #[test]
+    fn issue_423_undying_returns_when_sacrificed_in_resolution_choice() {
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+
+        // The ability source — its `Destroy SelfRef` reflexive will destroy
+        // this object inline (B1).
+        let source = make_artifact_source(&mut state, PlayerId(0), "Grist Stand-In");
+        let young_wolf = make_undying_creature(&mut state, PlayerId(0), "Young Wolf");
+        // A second sacrificeable creature so the Sacrifice does NOT hit the
+        // mandatory-all fast-path and instead routes through EffectZoneChoice.
+        let _decoy = make_creature(&mut state, PlayerId(0), "Decoy Bear", 2, 2);
+
+        let ability = sacrifice_then_when_you_do(reflexive_destroy_self());
+        let trigger = TriggerDefinition::new(TriggerMode::Phase).execute(ability);
+        push_pending_trigger_to_stack(
+            &mut state,
+            PendingTrigger {
+                source_id: source,
+                controller: PlayerId(0),
+                condition: trigger.condition,
+                ability: crate::game::ability_utils::build_resolved_from_def(
+                    trigger.execute.as_deref().unwrap(),
+                    source,
+                    PlayerId(0),
+                ),
+                timestamp: 0,
+                target_constraints: Vec::new(),
+                distribute: None,
+                trigger_event: None,
+                modal: None,
+                mode_abilities: vec![],
+                description: None,
+                may_trigger_origin: None,
+            },
+            &mut Vec::new(),
+        );
+
+        resolve_stack_until_paused(&mut state);
+        assert!(
+            matches!(state.waiting_for, WaitingFor::EffectZoneChoice { .. }),
+            "expected EffectZoneChoice for the sacrifice, got {:?}",
+            state.waiting_for
+        );
+
+        // Player chooses to sacrifice the Undying creature.
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: vec![young_wolf],
+            },
+        )
+        .expect("select Young Wolf to sacrifice");
+
+        // The Undying trigger must have been collected and dispatched; resolve
+        // whatever reached the stack.
+        resolve_stack_until_paused(&mut state);
+
+        let obj = state.objects.get(&young_wolf).expect("object tracked");
+        assert_eq!(
+            obj.zone,
+            Zone::Battlefield,
+            "Undying must return the sacrificed creature to the battlefield (CR 702.93a)"
+        );
+        let p1p1: u32 = obj
+            .counters
+            .iter()
+            .filter(|(ct, _)| **ct == crate::types::counter::CounterType::Plus1Plus1)
+            .map(|(_, n)| *n)
+            .sum();
+        assert_eq!(p1p1, 1, "Undying returns with exactly one +1/+1 counter");
+    }
+
+    /// CR 702.93a + issue #423 (4b): the negative path — an Undying creature
+    /// that is sacrificed WITH a +1/+1 counter already on it does NOT return;
+    /// the `Not(HadCounters)` intervening-if gates the trigger out.
+    #[test]
+    fn issue_423_undying_does_not_return_when_sacrificed_with_counter() {
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+
+        let source = make_artifact_source(&mut state, PlayerId(0), "Grist Stand-In");
+        let strangleroot = make_undying_creature(&mut state, PlayerId(0), "Strangleroot Geist");
+        state
+            .objects
+            .get_mut(&strangleroot)
+            .unwrap()
+            .counters
+            .insert(crate::types::counter::CounterType::Plus1Plus1, 1);
+        let _decoy = make_creature(&mut state, PlayerId(0), "Decoy Bear", 2, 2);
+
+        let ability = sacrifice_then_when_you_do(reflexive_destroy_self());
+        let trigger = TriggerDefinition::new(TriggerMode::Phase).execute(ability);
+        push_pending_trigger_to_stack(
+            &mut state,
+            PendingTrigger {
+                source_id: source,
+                controller: PlayerId(0),
+                condition: trigger.condition,
+                ability: crate::game::ability_utils::build_resolved_from_def(
+                    trigger.execute.as_deref().unwrap(),
+                    source,
+                    PlayerId(0),
+                ),
+                timestamp: 0,
+                target_constraints: Vec::new(),
+                distribute: None,
+                trigger_event: None,
+                modal: None,
+                mode_abilities: vec![],
+                description: None,
+                may_trigger_origin: None,
+            },
+            &mut Vec::new(),
+        );
+
+        resolve_stack_until_paused(&mut state);
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: vec![strangleroot],
+            },
+        )
+        .expect("select Strangleroot Geist to sacrifice");
+        resolve_stack_until_paused(&mut state);
+
+        let obj = state.objects.get(&strangleroot).expect("object tracked");
+        assert_eq!(
+            obj.zone,
+            Zone::Graveyard,
+            "Undying must NOT return a creature sacrificed with a +1/+1 counter (CR 702.93a)"
+        );
+    }
+
+    /// CR 603.2 + CR 603.3b + issue #423 (4c, the blocker case): an Undying
+    /// creature is sacrificed in the `EffectZoneChoice` handler whose reflexive
+    /// `WhenYouDo` continuation is itself an `Effect::Sacrifice` that raises a
+    /// second `EffectZoneChoice` (B2 — the action ends `!= Priority`, so
+    /// `run_post_action_pipeline`'s trigger scan never runs). A co-triggered
+    /// TARGETED dies-observer is on the battlefield. The handler must batch
+    /// BOTH dies-triggers into `deferred_triggers`; the next handler to settle
+    /// to `Priority` then flushes them. This is the case that fails pre-fix:
+    /// the sacrifice triggers were stranded when the reflexive paused.
+    #[test]
+    fn issue_423_co_triggered_targeted_observer_reaches_stack() {
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+
+        let source = make_artifact_source(&mut state, PlayerId(0), "Grist Stand-In");
+        let young_wolf = make_undying_creature(&mut state, PlayerId(0), "Young Wolf");
+        let _decoy = make_creature(&mut state, PlayerId(0), "Decoy Bear", 2, 2);
+
+        // Two opponent creatures: the reflexive `Sacrifice` of an opponent
+        // creature routes through `EffectZoneChoice` (2 eligible > 1), and they
+        // are also the legal targets for the observer's `Destroy`.
+        let observer = make_creature(&mut state, PlayerId(0), "Grim Observer", 1, 1);
+        let opp_a = make_creature(&mut state, PlayerId(1), "Opp Bear A", 2, 2);
+        let opp_b = make_creature(&mut state, PlayerId(1), "Opp Bear B", 2, 2);
+
+        // A dies-observer with a TARGETED trigger: "whenever a creature dies,
+        // tap target creature." Targets ANY creature so that — with the decoy,
+        // the observer itself, and a surviving opponent creature still on the
+        // battlefield — there are always at least two legal targets, forcing a
+        // `TriggerTargetSelection` pause when the observer is drained from the
+        // deferred queue. `Tap` (not `Destroy`) keeps the observer from
+        // recursively re-triggering on the creatures it affects.
+        let observer_trigger = TriggerDefinition::new(TriggerMode::ChangesZone)
+            .origin(Zone::Battlefield)
+            .destination(Zone::Graveyard)
+            .valid_card(TargetFilter::Typed(
+                TypedFilter::default().with_type(TypeFilter::Creature),
+            ))
+            .execute(AbilityDefinition::new(
+                AbilityKind::Database,
+                Effect::Tap {
+                    target: TargetFilter::Typed(
+                        TypedFilter::default().with_type(TypeFilter::Creature),
+                    ),
+                },
+            ));
+        {
+            let obj = state.objects.get_mut(&observer).unwrap();
+            obj.trigger_definitions.push(observer_trigger.clone());
+            std::sync::Arc::make_mut(&mut obj.base_trigger_definitions).push(observer_trigger);
+        }
+
+        // The reflexive `WhenYouDo` continuation is an opponent `Sacrifice`,
+        // which raises a fresh `EffectZoneChoice` (B2 pause) on resume.
+        let ability = sacrifice_then_when_you_do(reflexive_opponent_sacrifice());
+        let trigger = TriggerDefinition::new(TriggerMode::Phase).execute(ability);
+        push_pending_trigger_to_stack(
+            &mut state,
+            PendingTrigger {
+                source_id: source,
+                controller: PlayerId(0),
+                condition: trigger.condition,
+                ability: crate::game::ability_utils::build_resolved_from_def(
+                    trigger.execute.as_deref().unwrap(),
+                    source,
+                    PlayerId(0),
+                ),
+                timestamp: 0,
+                target_constraints: Vec::new(),
+                distribute: None,
+                trigger_event: None,
+                modal: None,
+                mode_abilities: vec![],
+                description: None,
+                may_trigger_origin: None,
+            },
+            &mut Vec::new(),
+        );
+
+        resolve_stack_until_paused(&mut state);
+        // First EffectZoneChoice — sacrifice the Undying creature.
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: vec![young_wolf],
+            },
+        )
+        .expect("select Young Wolf to sacrifice");
+
+        // (ii) The reflexive `WhenYouDo` continuation was NOT dropped — it
+        // resolved into a second `EffectZoneChoice` (the opponent sacrifice).
+        assert!(
+            matches!(state.waiting_for, WaitingFor::EffectZoneChoice { .. }),
+            "the reflexive opponent Sacrifice must raise an EffectZoneChoice, got {:?}",
+            state.waiting_for
+        );
+
+        // The Undying dies-trigger and the co-triggered observer trigger were
+        // batched into the deferred queue — they would be lost pre-fix.
+        assert_eq!(
+            state.deferred_triggers.len(),
+            2,
+            "the Undying dies-trigger and the targeted observer trigger must \
+             both be batched into deferred_triggers (issue #423)"
+        );
+
+        // Resolve the reflexive opponent sacrifice → the handler settles to
+        // `Priority` and drains the deferred queue.
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::SelectCards { cards: vec![opp_a] },
+        )
+        .expect("opponent sacrifices a creature");
+
+        // (iii) The drained targeted observer reached its own target selection.
+        assert!(
+            matches!(state.waiting_for, WaitingFor::TriggerTargetSelection { .. }),
+            "the targeted dies-observer must reach TriggerTargetSelection after the \
+             deferred flush, got {:?}",
+            state.waiting_for
+        );
+        // (i) The Undying dies-trigger reached the stack.
+        assert!(
+            state
+                .stack
+                .iter()
+                .any(|e| matches!(&e.kind, StackEntryKind::TriggeredAbility { .. })),
+            "the Undying dies-trigger must have reached the stack via the deferred flush"
+        );
+
+        // Pick the observer's target, then resolve everything. Undying returns.
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::ChooseTarget {
+                target: Some(TargetRef::Object(opp_b)),
+            },
+        )
+        .expect("choose observer Tap target");
+        resolve_stack_until_paused(&mut state);
+
+        let wolf = state.objects.get(&young_wolf).expect("wolf tracked");
+        assert_eq!(
+            wolf.zone,
+            Zone::Battlefield,
+            "Undying returned the sacrificed creature despite the co-triggered observer"
+        );
+    }
+
+    /// CR 701.21a + CR 702.93a + issue #423 (4d, Correction 1): a creature
+    /// sacrificed through the `ChooseAndSacrificeRest` / `CategoryChoice`
+    /// resolution handler (Diabolic Edict-class) must still fire its
+    /// dies-trigger. An Undying creature sacrificed this way returns.
+    #[test]
+    fn issue_423_choose_and_sacrifice_rest_fires_dies_trigger() {
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+
+        let source = make_artifact_source(&mut state, PlayerId(0), "Edict Stand-In");
+        let young_wolf = make_undying_creature(&mut state, PlayerId(0), "Young Wolf");
+        // A creature to keep, so player 0's choice is non-trivial (prompts a
+        // `CategoryChoice` rather than auto-resolving). Player 1 has no
+        // creatures, so only player 0 is asked.
+        let keeper = make_creature(&mut state, PlayerId(0), "Keeper Bear", 2, 2);
+
+        // ChooseAndSacrificeRest: each player keeps one creature, sacrifices the
+        // rest. Player 0 keeps the keeper → Young Wolf is sacrificed via the
+        // `CategoryChoice` resolution handler (issue #423 Correction 1: the
+        // reworked handler must still fire the resulting dies-trigger).
+        let ability = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::ChooseAndSacrificeRest {
+                categories: vec![CoreType::Creature],
+                chooser_scope: crate::types::ability::CategoryChooserScope::EachPlayerSelf,
+            },
+        );
+        let trigger = TriggerDefinition::new(TriggerMode::Phase).execute(ability);
+        push_pending_trigger_to_stack(
+            &mut state,
+            PendingTrigger {
+                source_id: source,
+                controller: PlayerId(0),
+                condition: trigger.condition,
+                ability: crate::game::ability_utils::build_resolved_from_def(
+                    trigger.execute.as_deref().unwrap(),
+                    source,
+                    PlayerId(0),
+                ),
+                timestamp: 0,
+                target_constraints: Vec::new(),
+                distribute: None,
+                trigger_event: None,
+                modal: None,
+                mode_abilities: vec![],
+                description: None,
+                may_trigger_origin: None,
+            },
+            &mut Vec::new(),
+        );
+
+        resolve_stack_until_paused(&mut state);
+        assert!(
+            matches!(state.waiting_for, WaitingFor::CategoryChoice { .. }),
+            "expected CategoryChoice, got {:?}",
+            state.waiting_for
+        );
+
+        // Keep the keeper; Young Wolf is left unchosen → sacrificed.
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::SelectCategoryPermanents {
+                choices: vec![Some(keeper)],
+            },
+        )
+        .expect("keep the keeper");
+        resolve_stack_until_paused(&mut state);
+
+        let wolf = state.objects.get(&young_wolf).expect("wolf tracked");
+        assert_eq!(
+            wolf.zone,
+            Zone::Battlefield,
+            "Undying must fire when the creature is sacrificed via ChooseAndSacrificeRest \
+             (issue #423 Correction 1)"
+        );
+    }
+
+    /// CR 603.2 + issue #423 (Step 5, class-level): a resolution-choice
+    /// `Effect::Sacrifice` of a creature with NO Undying still fires a generic
+    /// "whenever a creature dies" observer (Blood Artist-class) — the observer
+    /// reaches the stack via the `deferred_triggers` flush.
+    #[test]
+    fn issue_423_generic_dies_observer_fires_from_resolution_choice() {
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.players[0].life = 20;
+
+        let source = make_artifact_source(&mut state, PlayerId(0), "Grist Stand-In");
+        let victim = make_creature(&mut state, PlayerId(0), "Plain Bear", 2, 2);
+        let _decoy = make_creature(&mut state, PlayerId(0), "Decoy Bear", 2, 2);
+
+        // Blood Artist-class observer: whenever a creature dies, its
+        // controller gains 1 life.
+        let observer = make_creature(&mut state, PlayerId(0), "Blood Artist Stand-In", 0, 1);
+        let observer_trigger = TriggerDefinition::new(TriggerMode::ChangesZone)
+            .origin(Zone::Battlefield)
+            .destination(Zone::Graveyard)
+            .valid_card(TargetFilter::Typed(
+                TypedFilter::default().with_type(TypeFilter::Creature),
+            ))
+            .execute(AbilityDefinition::new(
+                AbilityKind::Database,
+                Effect::GainLife {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                    player: GainLifePlayer::Controller,
+                },
+            ));
+        {
+            let obj = state.objects.get_mut(&observer).unwrap();
+            obj.trigger_definitions.push(observer_trigger.clone());
+            std::sync::Arc::make_mut(&mut obj.base_trigger_definitions).push(observer_trigger);
+        }
+
+        let ability = sacrifice_then_when_you_do(reflexive_destroy_self());
+        let trigger = TriggerDefinition::new(TriggerMode::Phase).execute(ability);
+        push_pending_trigger_to_stack(
+            &mut state,
+            PendingTrigger {
+                source_id: source,
+                controller: PlayerId(0),
+                condition: trigger.condition,
+                ability: crate::game::ability_utils::build_resolved_from_def(
+                    trigger.execute.as_deref().unwrap(),
+                    source,
+                    PlayerId(0),
+                ),
+                timestamp: 0,
+                target_constraints: Vec::new(),
+                distribute: None,
+                trigger_event: None,
+                modal: None,
+                mode_abilities: vec![],
+                description: None,
+                may_trigger_origin: None,
+            },
+            &mut Vec::new(),
+        );
+
+        resolve_stack_until_paused(&mut state);
+        crate::game::engine::apply_as_current(
+            &mut state,
+            GameAction::SelectCards {
+                cards: vec![victim],
+            },
+        )
+        .expect("select Plain Bear to sacrifice");
+        resolve_stack_until_paused(&mut state);
+
+        assert_eq!(
+            state.players[0].life, 21,
+            "the Blood Artist-class dies-observer must resolve from the \
+             deferred-trigger flush (issue #423)"
+        );
     }
 }
 

@@ -2595,18 +2595,28 @@ pub fn resolve_ability_chain(
                 return Ok(());
             }
 
-            // CR 608.2c: When the parent effect suspended for a player choice
-            // (e.g. an optional "you may" prompt), an `IfYouDo` / `IfAPlayerDoes`
-            // gate cannot yet be evaluated — whether the effect was performed is
-            // not decided. Eagerly evaluating it here would read a stale
-            // `optional_effect_performed = false` and silently drop the
-            // conditional sub-ability (Ral, Monsoon Mage: "you may exile Ral.
-            // If you do, return him transformed"). Defer instead: stash the sub
-            // WITH its condition so `resolve_ability_chain`'s top-level
-            // condition check (CR 608.2c) re-evaluates it once the choice
-            // resolves and the flag is correct.
+            // CR 608.2c + CR 603.12: When the parent effect suspended for a
+            // player choice (e.g. an optional "you may" prompt, or the
+            // `EffectZoneChoice` raised by `Effect::Sacrifice` of N permanents),
+            // an `IfYouDo` / `IfAPlayerDoes` / `WhenYouDo` reflexive gate cannot
+            // yet be evaluated — whether the effect was performed is not decided
+            // until the player completes the choice. Eagerly evaluating it here
+            // would read a stale `optional_effect_performed = false` and either
+            // silently drop the conditional sub-ability (Ral, Monsoon Mage:
+            // "you may exile Ral. If you do, return him transformed") or, for a
+            // `WhenYouDo` reflexive, resolve its target selection immediately —
+            // overwriting the parent's `EffectZoneChoice` with the reflexive's
+            // `TriggerTargetSelection` and losing the sacrifice handler entirely
+            // (issue #423: Grist's `[-2]` "Sacrifice a creature. When you do,
+            // destroy …"). Defer instead: stash the sub WITH its condition so
+            // `resolve_ability_chain`'s top-level condition check re-evaluates it
+            // once the choice resolves and the flag is correct. `WhenYouDo` is
+            // checked explicitly here (not folded into
+            // `condition_depends_on_effect_performed`) so the condition-false
+            // descent at the parent-skipped path is left unchanged.
             if waits_for_resolution_choice(&state.waiting_for)
-                && condition_depends_on_effect_performed(condition)
+                && (condition_depends_on_effect_performed(condition)
+                    || matches!(condition, AbilityCondition::WhenYouDo))
             {
                 let mut sub_clone = sub.as_ref().clone();
                 if sub_clone.targets.is_empty() && !ability.targets.is_empty() {

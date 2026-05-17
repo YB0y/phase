@@ -1200,6 +1200,9 @@ pub(super) fn handle_resolution_choice(
             }
 
             if chosen.is_empty() {
+                // Issue #423 audit: no cards chosen — this branch moves no
+                // objects and emits no battlefield-exit events, so no
+                // dies-trigger collection is needed.
                 state.last_effect_count = Some(0);
                 events.push(GameEvent::EffectResolved {
                     kind: effect_kind,
@@ -1317,8 +1320,57 @@ pub(super) fn handle_resolution_choice(
                 kind: effect_kind,
                 source_id,
             });
+            // Mark the end of the battlefield-exit events produced by this
+            // handler (Sacrifice / ChangeZone / BounceAll) — the slice
+            // `events[events_before_effect..events_after_move]` is the exact
+            // set of dies-events whose triggers issue #423 must not lose.
+            let events_after_move = events.len();
+
+            // Step B: resolve the reflexive `WhenYouDo` continuation (Grist's
+            // `[-2]`). `waiting_for` is still `Priority` here, so
+            // `resume_with_error_propagation`'s guard passes and
+            // `drain_pending_continuation` runs.
             set_priority(state, player);
             resume_with_error_propagation(state, events)?;
+
+            // CR 603.2 + CR 603.3b: Issue #423 — dispatch the dies-triggers
+            // produced by this handler's permanent move (Undying CR 702.93a,
+            // Blood Artist-class observers). `PutAtLibraryPosition` moves cards
+            // within library/hand and emits no battlefield-exit events.
+            let moves_permanents = matches!(
+                effect_kind,
+                EffectKind::Sacrifice | EffectKind::ChangeZone | EffectKind::BounceAll
+            );
+            if moves_permanents {
+                if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+                    // B1: the reflexive continuation (if any) resolved without
+                    // input. `run_post_action_pipeline` will scan THIS action's
+                    // `events` and fire this move's dies-triggers normally — so
+                    // they are NOT collected here (that would double-fire).
+                    // But a *prior* paused action may have parked dies-triggers
+                    // in `deferred_triggers` (its `run_post_action_pipeline`
+                    // never ran); now that the game is settling to `Priority`,
+                    // drain that queue. If a drained trigger needs input, hand
+                    // back its `WaitingFor`.
+                    if let Some(wf) = super::triggers::drain_deferred_trigger_queue(state, events) {
+                        return Ok(ResolutionChoiceOutcome::WaitingFor(wf));
+                    }
+                } else {
+                    // B2: the reflexive continuation paused on player input, so
+                    // `run_post_action_pipeline`'s trigger scan will NOT run for
+                    // this action. Batch this move's dies-triggers into
+                    // `deferred_triggers` — the next handler that settles to
+                    // `Priority`, or `finalize_trigger_target_selection`, drains
+                    // them.
+                    let trigger_events: Vec<GameEvent> = events
+                        [events_before_effect..events_after_move]
+                        .iter()
+                        .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
+                        .cloned()
+                        .collect();
+                    super::triggers::collect_triggers_into_deferred(state, &trigger_events);
+                }
+            }
             ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
         }
         (
@@ -1346,6 +1398,9 @@ pub(super) fn handle_resolution_choice(
                 events,
             )
             .map_err(|error| EngineError::InvalidAction(error.to_string()))?;
+            // Issue #423 audit: `handle_topdeck_choice` moves cards between the
+            // hand and the top of the library — never off the battlefield — so
+            // it produces no dies-triggers and needs no collection here.
             state.last_effect_count = Some(chosen.len() as i32);
             set_priority(state, player);
             resume_with_error_propagation(state, events)?;
@@ -1614,40 +1669,73 @@ pub(super) fn handle_resolution_choice(
                 CategoryChooserScope::ControllerForAll
             };
 
+            // Issue #423 (Correction 1): `sacrifice_unchosen` moves permanents
+            // to the graveyard via `sacrifice_permanent`. Mark where those
+            // dies-events begin so the B2 branch below can batch their triggers.
+            let events_before_sacrifice = events.len();
+            // Clear `state.waiting_for` to a sentinel before advancing.
+            // `advance_to_next_player` / `sacrifice_unchosen` only WRITE
+            // `state.waiting_for` when they pause (a fresh `CategoryChoice` for
+            // the next chooser, or a replacement choice). When they auto-resolve
+            // and sacrifice, they leave `state.waiting_for` untouched — so
+            // without this reset the stale `CategoryChoice` of the chooser we
+            // just handled would still be present, and the `CategoryChoice`
+            // check below would wrongly treat a completed sacrifice as a pause.
+            set_priority(state, player);
             // Advance to next player or sacrifice.
             if remaining_players.is_empty() {
                 // All players have chosen — sacrifice everything not kept.
                 effects::choose_and_sacrifice_rest::sacrifice_unchosen_from_handler(
                     state, &all_kept, source_id, events,
                 );
-                set_priority(state, player);
-                resume_with_error_propagation(state, events)?;
+            } else if let Err(e) = effects::choose_and_sacrifice_rest::advance_to_next_player(
+                state,
+                &categories,
+                chooser_scope,
+                player, // controller for ControllerForAll
+                source_id,
+                &remaining_players,
+                all_kept,
+                events,
+            ) {
+                return Err(EngineError::InvalidAction(format!("{:?}", e)));
+            }
+            // If a sacrifice round set a fresh `CategoryChoice`, the run paused
+            // before any sacrifice — return directly.
+            if matches!(state.waiting_for, WaitingFor::CategoryChoice { .. }) {
                 ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
             } else {
-                match effects::choose_and_sacrifice_rest::advance_to_next_player(
-                    state,
-                    &categories,
-                    chooser_scope,
-                    player, // controller for ControllerForAll
-                    source_id,
-                    &remaining_players,
-                    all_kept,
-                    events,
-                ) {
-                    Ok(()) => {
-                        // If advance set a new WaitingFor, return it; otherwise priority.
-                        if matches!(state.waiting_for, WaitingFor::CategoryChoice { .. }) {
-                            ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
-                        } else {
-                            set_priority(state, player);
-                            resume_with_error_propagation(state, events)?;
-                            ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
-                        }
-                    }
-                    Err(e) => {
-                        return Err(EngineError::InvalidAction(format!("{:?}", e)));
-                    }
+                // The sacrifice (if any) is complete. Mark its event slice.
+                let events_after_sacrifice = events.len();
+                // Step B: if the sacrifice did not itself pause (no replacement
+                // choice was raised by `sacrifice_unchosen`), resolve any
+                // reflexive continuation. `state.waiting_for` is the `Priority`
+                // sentinel set before the advance unless a replacement choice
+                // was raised — in which case the continuation stays parked.
+                if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+                    resume_with_error_propagation(state, events)?;
                 }
+                // CR 603.2 + CR 603.3b: Issue #423 (Correction 1) — dispatch the
+                // dies-triggers from `sacrifice_unchosen` (Undying CR 702.93a,
+                // Blood Artist-class observers). Mirrors the `EffectZoneChoice`
+                // Sacrifice arm: B1 (`Priority`) lets `run_post_action_pipeline`
+                // scan this action's events and drains any prior parked queue;
+                // B2 (paused) batches this action's sacrifice events for a
+                // later drain.
+                if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+                    if let Some(wf) = super::triggers::drain_deferred_trigger_queue(state, events) {
+                        return Ok(ResolutionChoiceOutcome::WaitingFor(wf));
+                    }
+                } else {
+                    let trigger_events: Vec<GameEvent> = events
+                        [events_before_sacrifice..events_after_sacrifice]
+                        .iter()
+                        .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
+                        .cloned()
+                        .collect();
+                    super::triggers::collect_triggers_into_deferred(state, &trigger_events);
+                }
+                ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
             }
         }
         (waiting_for, action) => {
