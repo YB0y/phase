@@ -12393,6 +12393,95 @@ mod dedup_regression_tests {
         );
     }
 
+    /// Issue #451 — RUNTIME PIPELINE TEST. CR 603.4 + CR 701.21: A who-controls
+    /// sacrifice trigger ("Whenever an opponent who controls an artifact
+    /// sacrifices a permanent, ...") must parse the relative clause into an
+    /// `ObjectCount >= 1` intervening-if and gate the trigger correctly at
+    /// runtime.
+    ///
+    /// This drives the real pipeline: the parser produces the `TriggerMode`
+    /// and `TriggerDefinition.condition`, then `check_trigger_condition` (the
+    /// exact evaluator `apply` uses for intervening-ifs) is run against a real
+    /// `GameState`. The triggering player (the sacrificer) is bound from a
+    /// `PermanentSacrificed` event. NOT a shape test — the condition under test
+    /// is the parser's actual output, evaluated by the runtime evaluator.
+    #[test]
+    fn issue_451_who_controls_sacrifice_trigger_gates_at_runtime() {
+        let mut ctx = crate::parser::oracle_ir::context::ParseContext::default();
+        let (mode, def) = crate::parser::oracle_trigger::parse_trigger_condition(
+            "Whenever an opponent who controls an artifact sacrifices a permanent",
+            &mut ctx,
+        );
+        assert_eq!(
+            mode,
+            TriggerMode::Sacrificed,
+            "who-controls sacrifice line must parse to Sacrificed (not Unknown)",
+        );
+        let condition = def
+            .condition
+            .expect("the who-controls clause must be lifted into def.condition");
+
+        let mut state = GameState::new_two_player(42);
+        let controller = PlayerId(0); // the trigger source's controller
+        let sacrificer = PlayerId(1); // the opponent who sacrifices
+
+        // Sacrifice event — the triggering player is the sacrificer (P1).
+        let sac_event = GameEvent::PermanentSacrificed {
+            object_id: ObjectId(777),
+            player_id: sacrificer,
+        };
+
+        // No one controls an artifact → the who-controls intervening-if fails.
+        assert!(
+            !check_trigger_condition(&state, &condition, controller, None, Some(&sac_event)),
+            "with no artifact in play the who-controls clause must fail the trigger",
+        );
+
+        // The CONTROLLER (P0) controls an artifact, but the triggering player
+        // is P1 → the clause (scoped to TriggeringPlayer) still fails.
+        let p0_artifact = create_object(
+            &mut state,
+            CardId(300),
+            controller,
+            "Some Artifact".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&p0_artifact)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Artifact);
+        assert!(
+            !check_trigger_condition(&state, &condition, controller, None, Some(&sac_event)),
+            "an artifact controlled by the trigger's controller (not the \
+             sacrificer) must NOT satisfy 'who controls an artifact'",
+        );
+
+        // The SACRIFICER (P1, the triggering player) controls an artifact →
+        // the who-controls clause is satisfied and the trigger fires.
+        let p1_artifact = create_object(
+            &mut state,
+            CardId(301),
+            sacrificer,
+            "Some Artifact".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&p1_artifact)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Artifact);
+        assert!(
+            check_trigger_condition(&state, &condition, controller, None, Some(&sac_event)),
+            "an artifact controlled by the sacrificing (triggering) player \
+             must satisfy 'who controls an artifact' and fire the trigger",
+        );
+    }
+
     #[test]
     fn defending_player_life_quantity_reads_attack_event_player_target() {
         use crate::game::combat::AttackTarget;
