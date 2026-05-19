@@ -411,7 +411,11 @@ export function HostSetup({
                         className="rounded bg-gray-700 px-1.5 py-0.5 text-xs text-white outline-none"
                       >
                         {DIFFICULTY_OPTIONS.map((d) => (
-                          <option key={d} value={d}>
+                          <option
+                            key={d}
+                            value={d}
+                            className="bg-[#0a0f1b] text-slate-100"
+                          >
                             {d}
                           </option>
                         ))}
