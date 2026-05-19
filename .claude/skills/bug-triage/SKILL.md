@@ -25,11 +25,15 @@ bun scripts/sync-bug-reports.ts render
 # reports get missed. `triage` prints the delta + an orphan roll-call.
 bun scripts/sync-bug-reports.ts delta      # re-emit delta without re-classifying
 
-# Publish: create GH issues for `create_issue` triage items AND react 👀 +
-# post a tracking link inside the originating Discord thread. Also reconciles
-# threads whose triage item is already linked to an open issue (write-back
-# only — no duplicate creation). Once-per-thread; mapping persisted in
-# triage/sync-state.json under `published_threads`.
+# Publish: for each --thread, CREATE a new GH issue from the triage item AND
+# react 👀 + post a tracking link inside the originating Discord thread.
+# IMPORTANT: `publish` ALWAYS creates a NEW issue (resolveIssue(..., "created"))
+# — it has NO reconcile / write-back-only mode, despite older doc claims. The
+# ONLY dedup gate is `published_threads` in triage/sync-state.json: a thread
+# already recorded there is skipped entirely (no issue, no write-back). So use
+# `publish` ONLY for threads that have NO GH issue yet. If an issue already
+# exists (incl. one you filed by hand), do NOT run `publish` — it would create
+# a duplicate. Use the manual write-back procedure below instead.
 bun scripts/sync-bug-reports.ts publish --thread=<id>[,<id>...] --dry-run   # preview without side effects
 bun scripts/sync-bug-reports.ts publish --thread=<id>[,<id>...]             # create GH issue + Discord write-back
 
@@ -52,6 +56,85 @@ gh issue view <N> --repo phase-rs/phase --json subIssues,title,body
 # Browse closed trackers (retrospective archive)
 gh issue list --repo phase-rs/phase --label "collector" --state closed --limit 50 --json number,title,closedAt
 ```
+
+## Discord Write-Back — MANDATORY After Every Issue Filing
+
+**Invariant:** every Discord-sourced thread that ends up with a GH issue (newly
+filed OR linked to an existing one) MUST finish with BOTH:
+1. a 👀 reaction on the thread's starter message, AND
+2. a `🔗 Tracked in <issue-url>` reply posted inside the thread.
+
+The thread is "done" only when the reporter can see the eyes + the link. A
+`published_threads` entry in `triage/sync-state.json` is the *bookkeeping* of
+that — it is NOT a substitute for it.
+
+### The recurring failure (do NOT do this)
+
+Hand-writing a `published_threads` entry **without posting the write-back**
+marks the thread as published while the Discord thread still has no reaction
+and no link. An entry with empty `reacted_message_id` / `reply_message_id` is
+the signature of this bug. Never record `published_threads` for a thread you
+have not actually written back to.
+
+### Two paths — pick by whether a GH issue already exists
+
+**Path A — no GH issue exists yet for the thread.** Use `publish`. It creates
+the issue, posts the 👀 + link, and records `published_threads` with the real
+message ids — all in one step. Nothing else to do.
+
+```bash
+bun scripts/sync-bug-reports.ts publish --thread=<id>[,<id>...]
+```
+
+**Path B — a GH issue already exists** (you filed it by hand because heuristic
+card extraction mangled the card names; or you appended to / commented on an
+existing issue; or you deduped to a prior issue). `publish` would create a
+DUPLICATE here — do NOT run it. Do the write-back by hand, then record state.
+For a thread, the starter message id equals the thread id, and the channel id
+equals the thread id. `$DISCORD_BOT_TOKEN` is in `.env`.
+
+```bash
+set -a; . ./.env; set +a            # load DISCORD_BOT_TOKEN
+TID=<thread_id>; ISSUE=<issue_number>
+
+# 1. React 👀 on the thread starter (%F0%9F%91%80 is the 👀 emoji):
+curl -sf -X PUT -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+  "https://discord.com/api/v10/channels/$TID/messages/$TID/reactions/%F0%9F%91%80/@me"
+
+# 2. Post the tracking link — capture the returned message id:
+REPLY_ID=$(curl -sf -X POST -H "Authorization: Bot $DISCORD_BOT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"content\":\"🔗 Tracked in https://github.com/phase-rs/phase/issues/$ISSUE\"}" \
+  "https://discord.com/api/v10/channels/$TID/messages" | jq -r .id)
+echo "posted reply $REPLY_ID"
+```
+
+Then — and only after both calls succeeded — record `published_threads` with
+the REAL ids (never empty strings):
+
+```bash
+jq --arg t "$TID" --argjson n "$ISSUE" --arg r "$REPLY_ID" --arg ts "$(date -u +%FT%TZ)" \
+  '.published_threads[$t] = {issue_number:$n, issue_url:("https://github.com/phase-rs/phase/issues/"+($n|tostring)), reacted_message_id:$t, reply_message_id:$r, published_at:$ts, mode:"reconciled"}' \
+  triage/sync-state.json > triage/sync-state.json.tmp && mv triage/sync-state.json.tmp triage/sync-state.json
+```
+
+If a thread is archived, the Discord calls fail with error `50083` — archive
+is the maintainer's manual "resolved" signal; leave it, do not unarchive.
+
+### Verify before declaring triage done
+
+For every thread touched this cycle, confirm its `published_threads` entry that
+points at a real issue (`issue_number > 0`) also has a non-empty
+`reply_message_id`. (`mark-handled` sentinels legitimately have `issue_number:
+0` and empty write-back ids — they are not bugs and are excluded below.)
+
+```bash
+jq -r '.published_threads | to_entries[] | select(.value.issue_number > 0 and (.value.reply_message_id == "" or .value.reacted_message_id == "")) | .key' triage/sync-state.json
+```
+
+This MUST print nothing. Any thread id it prints has a real GH issue but was
+marked published without a Discord write-back — go post the 👀 + link (Path B)
+and re-record with the real message ids.
 
 ## GitHub Issue Workflow
 
@@ -215,31 +298,33 @@ When the pipeline-driving harness doesn't exist yet, **build it as part of the w
 
 Session memory pointer: `feedback_runtime_tests_must_drive_pipeline.md`.
 
-### No Default Deferral — Build the Missing Infrastructure
+### Fix It While You're There — No Default Deferral, No New Issues
 
-When a card bug requires a missing engine primitive (new enum variant, parser combinator, runtime resolver case, LKI plumbing, target filter, etc.), **build the primitive as part of the fix**. Use the reported card as the validating consumer. Do NOT file a deferred follow-up issue and ship a half-fix.
+**Hard rule (user directive, overrides any "file it separately" instinct below or elsewhere):** When you discover a bug — adjacent, pre-existing, in an unrelated module, whatever — *while you are already in the code*, **fix it in the same commit**. Do NOT file a new GitHub issue. Do NOT defer it to a follow-up task. Do NOT ship a half-fix and a TODO. You are already there; fix it.
 
-Deferral is reserved for genuinely massive work:
-- Multi-day rewrites cross-cutting through stack / SBA / replacement pipelines
-- Architectural primitives that need their own RFC (e.g., Soulbond pair-binding, DSK Rooms door-unlock)
-- Work that requires user-facing UI design decisions
+**Scope — this rule governs ONE of two bug categories. Do not conflate them:**
+- **Category 1 — a bug discovered WHILE implementing a fix** (adjacent, pre-existing, in another module — noticed while tracing or editing). This section governs it: fix inline, same commit, never ticket.
+- **Category 2 — a genuinely NEW user-reported bug** ingested by the triage pipeline (a Discord report). This section does NOT govern it. Category-2 bugs MUST be filed as GitHub issues via the `publish` step — that is the canonical, required intake path (see "Publish" above); GitHub is the only durable record of a user report. Running `publish` is correct and is **not** a violation of the no-new-issues rule.
 
-A few hundred LOC of typed plumbing in the engine crate is NOT deferral-worthy. Examples from the 2026-05-11 session where the agent (correctly) built infrastructure instead of deferring:
+This applies to:
+- A missing engine primitive the fix requires (new enum variant, parser combinator, runtime resolver case, LKI plumbing, target filter, etc.) — **build the primitive as part of the fix**, with the reported card as the validating consumer.
+- A pre-existing bug in an unrelated file that you notice while tracing or editing — **fix it in the same commit**, even though it is not the reported bug. (Previously this skill said "file as a cleanup ticket"; that guidance is retired.)
+- A latent CR-correctness bug discovered next to the code you are changing — fix it (e.g., #351 Modular discovered `resolve_counters_on_scope::Source` short-circuited LKI — fixed inline, not ticketed).
 
-- #353 Undying/Persist: investigated whether LKI plumbing existed for dies-trigger counter inspection. It did (`apply_zone_exit_cleanup` snapshots counters into `LKISnapshot.counters`). Zero new infrastructure needed.
-- #351 Modular: discovered `resolve_counters_on_scope::Source` had a CR-correctness bug (live-state short-circuit bypassing LKI). Fixed it as part of the Modular work rather than filing as a separate ticket.
-- #352 Annihilator: needed "defending player for this attack" target wiring. Reused existing `ControllerRef::DefendingPlayer` (verified by tracing through `combat::defending_player_for_attacker`). Zero new variants.
+For **Category-1** bugs (discovered mid-fix), `gh issue create` is **not** part of the implementer or orchestrator workflow. Do not file new issues for bugs you discover while already in the code. Track that discovered work in the task list and route it through the same plan → review → implement gates as the primary work — but do not park it on GitHub. This does NOT restrict the triage `publish` step, which files **Category-2** new user reports as GH issues — that path is required, not optional.
 
-What gets filed as a separate issue:
-- Architectural design choices that affect multiple keywords/cards uniformly (e.g., #359 KeywordTriggerInstaller registry — affects all build-time-synthesized triggered keywords)
-- Pre-existing bugs in unrelated files discovered during review (file as a cleanup ticket; don't expand the current commit's scope into other modules)
-- Pi-round-class refactors lifting stringly-typed AST fields to typed enums (e.g., #364 CounterType Π-8 lift)
+**There is no size-based deferral.** "This is too big," "this is multi-day," "this is a large refactor" are NOT valid reasons to defer — you are an efficient LLM and the work in this codebase is not multi-day. Fix it. The *only* thing you ever surface instead of fixing is an unresolved **design question that needs a human decision** — a user-facing UX choice, or an architectural direction with genuine trade-offs where picking wrong is expensive. Effort, scope, and line-count are never the reason; an open design question is. Even then: do not `gh issue create` — describe the question in your report to the orchestrator and let the human decide.
+
+Examples of correctly fixing-while-there (2026-05-11 session):
+- #353 Undying/Persist: investigated whether LKI plumbing existed; it did (`apply_zone_exit_cleanup` snapshots counters into `LKISnapshot.counters`). Zero new infrastructure needed.
+- #351 Modular: discovered a CR-correctness bug in `resolve_counters_on_scope::Source` and fixed it as part of the Modular work.
+- #352 Annihilator: reused existing `ControllerRef::DefendingPlayer` (traced through `combat::defending_player_for_attacker`). Zero new variants.
 
 **In briefs to implementer agents, include**:
 
-> If your work requires a missing primitive, enum variant, parser combinator, or runtime path: **build it as part of this commit**. Use the reported card as the validating consumer. Defer ONLY if the work is genuinely multi-day cross-cutting (and explain why in your report).
+> If you discover ANY bug — the reported one, an adjacent one, a pre-existing one in another module — while working in this code: **fix it in this commit**. Build any missing primitive, enum variant, parser combinator, or runtime path the fix needs, with the reported card as the validating consumer. Do NOT file a GitHub issue and do NOT defer. Size is never a reason to defer — this codebase has no multi-day work and you are an efficient LLM. The ONLY thing you surface instead of fixing is an open *design question* that needs a human decision (a UX choice or a genuine architectural trade-off); surface it in your report, do not ticket it and do not let it block the rest of the fix.
 
-Session memory pointer: `feedback_no_default_deferral.md`.
+Session memory pointer: `feedback_address_inline_no_new_issues.md` (supersedes `feedback_no_default_deferral.md`).
 
 ### Multi-Agent Safe Staging
 
@@ -302,7 +387,7 @@ Run at session end on newly filed issues, and at session start on the unclustere
 - **Perpetual tier buckets** — NEVER invent `tier:1` / `tier:2` labels or "Tier N" parent issues. Tier is relative; trackers are durable; the mismatch creates name drift.
 - **Cross-tracker membership** — one parent per child is an API constraint. Pick the dominant theme (see Tiebreaker below).
 - **Invented label families** — NEVER invent `cluster:*`, `theme:*`, or other grouping labels. Structural label families are FIXED: `priority`, `area`, `mechanic`, `source`, `resolution`, `special`, `status`. Clustering is expressed through sub-issue parentage on a `collector`-labelled tracker, period.
-- **Deferral mechanism** — filing a sub-issue under a tracker is NOT a substitute for building missing infrastructure during the originating fix (see *No Default Deferral* above). Trackers organize work that is legitimately separate (architectural follow-ups discovered post-commit, RFC-class items, Π-round refactors), not in-scope plumbing punted to "later."
+- **Deferral mechanism** — filing a sub-issue under a tracker is NOT a substitute for fixing a bug while you are in the code (see *Fix It While You're There* above). Do not create new issues for discovered bugs — fix them in the same commit. Trackers are a read/organize view over issues that already exist, not a place to park discovered work.
 
 ### Tracker format
 
