@@ -227,6 +227,8 @@ export class DraftAdapter {
     kind: "Premier" | "Traditional",
     seed: number,
     draftCode: string,
+    tournamentFormat: TournamentFormat,
+    podPolicy: PodPolicy,
   ): Promise<DraftPlayerView> {
     const wasm = await ensureDraftWasm();
     const kindId = kind === "Premier" ? 1 : 2;
@@ -236,6 +238,8 @@ export class DraftAdapter {
       kindId,
       seed,
       draftCode,
+      tournamentFormat,
+      podPolicy,
     ) as DraftPlayerView;
   }
 

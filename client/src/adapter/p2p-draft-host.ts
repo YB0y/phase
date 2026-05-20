@@ -14,7 +14,7 @@ import type { DataConnection } from "peerjs";
 
 import { DraftAdapter } from "./draft-adapter";
 import type { DraftPlayerView, MultiplayerSeatDescriptor, PairingView, SeatPublicView } from "./draft-adapter";
-import type { PodPolicy } from "./draft-adapter";
+import type { PodPolicy, TournamentFormat } from "./draft-adapter";
 import {
   createDraftPeerSession,
   type DraftPeerSession,
@@ -105,7 +105,6 @@ export class P2PDraftHost {
   private timerRemainingMs = 0;
   private timerEndAt = 0;
   private timerContext: "pick" | "sideboard" | "playdraw" | null = null;
-  private podPolicy: PodPolicy = "Competitive";
   private bo3State = new Map<string, Bo3MatchState>();
 
   // Server backup upload state (D-08)
@@ -122,6 +121,8 @@ export class P2PDraftHost {
     private readonly kind: "Premier" | "Traditional",
     private readonly podSize: number,
     private readonly hostDisplayName: string,
+    private readonly tournamentFormat: TournamentFormat,
+    private readonly podPolicy: PodPolicy,
     private readonly gracePeriodMs: number = DRAFT_GRACE_PERIOD_MS,
     private readonly persistenceId?: string,
     private readonly roomCode?: string,
@@ -394,13 +395,14 @@ export class P2PDraftHost {
       this.kind,
       seed,
       draftCode,
+      this.tournamentFormat,
+      this.podPolicy,
     );
 
     this.draftStarted = true;
     this.draftCode = draftCode;
     this.activePodSize = seats.length;
     this.picksThisRound.clear();
-    this.podPolicy = hostView.pod_policy;
 
     // Send each guest their filtered view
     for (const [seat, session] of this.guestSessions) {
@@ -714,7 +716,6 @@ export class P2PDraftHost {
   async generatePairings(round: number): Promise<void> {
     try {
       const view = await this.adapter.generatePairings(round);
-      this.podPolicy = view.pod_policy;
 
       // Send draft_match_start to each guest with their opponent info
       for (const pairing of view.pairings) {
@@ -1035,6 +1036,8 @@ export class P2PDraftHost {
           kind: this.kind,
           podSize: this.podSize,
           hostDisplayName: this.hostDisplayName,
+          tournamentFormat: this.tournamentFormat,
+          podPolicy: this.podPolicy,
           seatTokens: Object.fromEntries(this.seatTokens),
           seatNames: Object.fromEntries(this.seatNames),
           kickedTokens: [...this.kickedTokens],

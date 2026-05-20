@@ -352,6 +352,8 @@ export const useMultiplayerDraftStore = create<
           kind: config.kind,
           podSize: config.podSize,
           hostDisplayName: config.hostDisplayName,
+          tournamentFormat: config.tournamentFormat,
+          podPolicy: config.podPolicy,
           phase,
           pickCount: view?.pool.length ?? 0,
           updatedAt: Date.now(),

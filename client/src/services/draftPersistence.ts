@@ -28,6 +28,8 @@ export interface PersistedDraftHostSession {
   kind: "Premier" | "Traditional";
   podSize: number;
   hostDisplayName: string;
+  tournamentFormat: "Swiss" | "SingleElimination";
+  podPolicy: "Competitive" | "Casual";
   /** Seat index -> token. */
   seatTokens: Record<number, string>;
   /** Seat index -> display name. */
@@ -72,6 +74,8 @@ export interface ActiveDraftPodMeta {
   kind: "Premier" | "Traditional";
   podSize: number;
   hostDisplayName: string;
+  tournamentFormat: "Swiss" | "SingleElimination";
+  podPolicy: "Competitive" | "Casual";
   phase: ActiveDraftPodPhase;
   pickCount: number;
   updatedAt: number;

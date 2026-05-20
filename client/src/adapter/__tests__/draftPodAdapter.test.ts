@@ -391,6 +391,17 @@ describe("DraftPodGuestAdapter", () => {
     expect(statusEvents).toContainEqual({ type: "statusChanged", status: "lobby" });
   });
 
+  it("looks up reconnect tokens by host peer id", async () => {
+    const { loadDraftGuestSession } = await import("../../services/draftPersistence");
+
+    await adapter.initialize({
+      roomCode: "ABCDE",
+      displayName: "Alice",
+    });
+
+    expect(loadDraftGuestSession).toHaveBeenCalledWith("phase2-ABCDE");
+  });
+
   it("emits error on connection failure", async () => {
     const { joinRoom } = await import("../../network/connection");
     (joinRoom as ReturnType<typeof vi.fn>).mockRejectedValue(

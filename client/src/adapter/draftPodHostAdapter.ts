@@ -154,6 +154,8 @@ export class DraftPodHostAdapter {
         config.kind,
         config.podSize,
         config.hostDisplayName,
+        config.tournamentFormat,
+        config.podPolicy,
         undefined, // default grace period
         config.persistenceId,
         hostResult.roomCode,
