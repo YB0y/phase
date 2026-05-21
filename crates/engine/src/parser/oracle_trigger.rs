@@ -6810,7 +6810,13 @@ fn try_parse_counter_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefinit
 
     let mut def = make_base();
     def.mode = TriggerMode::CounterAdded;
-    if let Some(filter) = parse_counter_threshold_prefix(counter_prefix) {
+    // CR 122.1: capture an explicit counter restriction so the trigger fires
+    // only on the named counter kind — a threshold form ("the twelfth hour
+    // counter") or a plain type form ("one or more -1/-1 counters", Hapatra).
+    // No type word ("one or more counters") leaves the filter unset → any kind.
+    if let Some(filter) = parse_counter_threshold_prefix(counter_prefix)
+        .or_else(|| parse_counter_type_prefix(counter_prefix))
+    {
         def = def.counter_filter(filter);
     }
 
@@ -6849,6 +6855,56 @@ fn parse_counter_threshold_prefix(prefix: &str) -> Option<CounterTriggerFilter> 
     Some(CounterTriggerFilter {
         counter_type: crate::types::counter::parse_counter_type(counter_type_text),
         threshold: Some(threshold),
+    })
+}
+
+/// CR 122.1: Extract an explicit counter *type* from the text preceding
+/// "counter" in a placement trigger ("you put one or more -1/-1 counters
+/// on …", "a +1/+1 counter is put on …"). Strips the leading timing word,
+/// optional placement verb, and quantity phrase (article / "one or more" /
+/// numeral); whatever typed remainder names the counter type. Returns `None`
+/// when no type word remains ("one or more counters" → any kind, no filter),
+/// so the trigger keeps firing on every counter as printed.
+fn parse_counter_type_prefix(prefix: &str) -> Option<CounterTriggerFilter> {
+    let (rest, _) = opt(alt((
+        tag::<_, _, OracleError<'_>>("whenever "),
+        tag("when "),
+    )))
+    .parse(prefix.trim_start())
+    .ok()?;
+    let (rest, _) = opt(alt((
+        tag::<_, _, OracleError<'_>>("you've put "),
+        tag("you have put "),
+        tag("you put "),
+    )))
+    .parse(rest)
+    .ok()?;
+    let (rest, _) = opt(alt((
+        tag::<_, _, OracleError<'_>>("one or more "),
+        tag("another "),
+        tag("an "),
+        tag("a "),
+    )))
+    .parse(rest)
+    .ok()?;
+    // Optional numeral count ("you put two +1/+1 counters …"). Counter types
+    // never begin with a bare digit, so a leading "number " is safely a
+    // quantity; consume it (number + trailing space) as one combinator.
+    let rest = (
+        nom_primitives::parse_number,
+        tag::<_, _, OracleError<'_>>(" "),
+    )
+        .parse(rest)
+        .map_or(rest, |(after, _)| after);
+    // Only build a filter when the remainder is a genuinely recognized counter
+    // type. The prefix strip is deliberately loose, so non-"you" subjects ("an
+    // opponent puts …", "you create a token or put a …") leave leftover subject
+    // text here; `try_parse_counter_type` rejects multi-word junk (→ None), so
+    // those any-counter triggers keep firing on every counter as printed.
+    let counter_type = crate::types::counter::try_parse_counter_type(rest.trim())?;
+    Some(CounterTriggerFilter {
+        counter_type,
+        threshold: None,
     })
 }
 
@@ -9769,6 +9825,60 @@ mod tests {
             sub.effect.target_filter(),
             Some(&TargetFilter::ParentTarget),
             "return-that-card must bind to the chosen permanent (ParentTarget), not TriggeringSource"
+        );
+    }
+
+    #[test]
+    fn counter_added_trigger_captures_explicit_type() {
+        // CR 122.1: Hapatra — "Whenever you put one or more -1/-1 counters on a
+        // creature, create a Snake" must fire ONLY on -1/-1 counters, not any
+        // counter. The type-prefix extractor sets counter_filter. (#589)
+        let def = parse_trigger_line(
+            "Whenever you put one or more -1/-1 counters on a creature, create a 1/1 green Snake creature token with deathtouch.",
+            "Hapatra, Vizier of Poisons",
+        );
+        assert_eq!(def.mode, TriggerMode::CounterAdded);
+        let filter = def
+            .counter_filter
+            .as_ref()
+            .expect("explicit -1/-1 counter type must be captured");
+        assert_eq!(
+            filter.counter_type,
+            crate::types::counter::CounterType::Minus1Minus1
+        );
+        assert_eq!(filter.threshold, None, "no threshold form here");
+    }
+
+    #[test]
+    fn counter_added_trigger_generic_has_no_type_filter() {
+        // "one or more counters" (no type word) keeps firing on any counter
+        // kind — the extractor must leave counter_filter unset.
+        let def = parse_trigger_line(
+            "Whenever you put one or more counters on a creature, draw a card.",
+            "Test Card",
+        );
+        assert_eq!(def.mode, TriggerMode::CounterAdded);
+        assert!(
+            def.counter_filter.is_none(),
+            "generic counter trigger must not set a type filter"
+        );
+    }
+
+    #[test]
+    fn counter_added_trigger_rejects_non_type_remainder() {
+        // Regression (#589 review): the prefix strip is loose, so a non-"you"
+        // subject ("an opponent puts one or more counters") leaves leftover
+        // subject text in the type slot. try_parse_counter_type must reject that
+        // multi-word junk → counter_filter stays None → the any-counter trigger
+        // (Bold Plagiarist class) keeps firing on every counter, not none.
+        let def = parse_trigger_line(
+            "Whenever an opponent puts one or more counters on a creature they control, create a 1/1 colorless Thopter artifact creature token with flying.",
+            "Test Card",
+        );
+        assert_eq!(def.mode, TriggerMode::CounterAdded);
+        assert!(
+            def.counter_filter.is_none(),
+            "loose prefix strip must not manufacture a bogus typed filter from subject text"
         );
     }
 
