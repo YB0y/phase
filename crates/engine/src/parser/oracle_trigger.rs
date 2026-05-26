@@ -5452,6 +5452,14 @@ fn try_parse_named_trigger_mode(lower: &str) -> Option<(TriggerMode, TriggerDefi
         return Some(result);
     }
 
+    // CR 104.3a: "Whenever [player] loses the game" — player-loss trigger.
+    if let Some(valid_target) = parse_loses_game_trigger(lower) {
+        let mut def = make_base();
+        def.mode = TriggerMode::LosesGame;
+        def.valid_target = valid_target;
+        return Some((TriggerMode::LosesGame, def));
+    }
+
     // CR 701.54d: "Whenever the Ring tempts you" / "When the Ring tempts you" —
     // the Ring temptation event fires once per temptation resolution.
     if all_consuming(pair(
@@ -5489,6 +5497,36 @@ fn parse_coin_flip_result_trigger(lower: &str) -> Option<(Option<TargetFilter>, 
     .parse(lower)
     .ok()?;
     Some((target, result))
+}
+
+fn parse_loses_game_trigger(lower: &str) -> Option<Option<TargetFilter>> {
+    let (_, target) = all_consuming(preceded(
+        alt((tag::<_, _, OracleError<'_>>("whenever "), tag("when "))),
+        parse_loses_game_actor,
+    ))
+    .parse(lower)
+    .ok()?;
+    Some(target)
+}
+
+fn parse_loses_game_actor(input: &str) -> OracleResult<'_, Option<TargetFilter>> {
+    let (rest, (target, third_person)) = alt((
+        value((Some(TargetFilter::Controller), false), tag("you ")),
+        value(
+            (
+                Some(TargetFilter::Typed(
+                    TypedFilter::default().controller(ControllerRef::Opponent),
+                )),
+                true,
+            ),
+            tag("an opponent "),
+        ),
+        value((Some(TargetFilter::Player), true), tag("a player ")),
+    ))
+    .parse(input)?;
+    let verb = if third_person { "loses" } else { "lose" };
+    let (rest, _) = pair(tag(verb), tag(" the game")).parse(rest)?;
+    Ok((rest, target))
 }
 
 fn try_parse_die_roll_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefinition)> {
@@ -20932,6 +20970,63 @@ mod snapshot_tests {
         );
         assert_eq!(def.mode, TriggerMode::Exerted);
         assert!(def.valid_card.is_some());
+    }
+
+    /// CR 104.3a: "Whenever a player loses the game" — Withengar Unbound,
+    /// Ramses Assassin Lord, Blood Tyrant. The explicit player subject is
+    /// represented as a player filter so the trigger's player axis is typed.
+    #[test]
+    fn trigger_a_player_loses_the_game() {
+        let def = parse_trigger_line(
+            "Whenever a player loses the game, put thirteen +1/+1 counters on this creature.",
+            "Withengar Unbound",
+        );
+        assert_eq!(
+            def.mode,
+            TriggerMode::LosesGame,
+            "expected LosesGame mode, got {:?}",
+            def.mode
+        );
+        assert_eq!(
+            def.valid_target,
+            Some(TargetFilter::Player),
+            "valid_target must represent the player-loss subject"
+        );
+    }
+
+    /// CR 104.3a: "Whenever an opponent loses the game" — scopes to opponent
+    /// players only via a controller filter.
+    #[test]
+    fn trigger_an_opponent_loses_the_game() {
+        let def = parse_trigger_line(
+            "Whenever an opponent loses the game, you win the game.",
+            "SomeCard",
+        );
+        assert_eq!(
+            def.mode,
+            TriggerMode::LosesGame,
+            "expected LosesGame mode, got {:?}",
+            def.mode
+        );
+        assert_eq!(
+            def.valid_target,
+            Some(TargetFilter::Typed(
+                TypedFilter::default().controller(ControllerRef::Opponent)
+            )),
+            "valid_target must restrict to opponents"
+        );
+    }
+
+    /// CR 104.3a: "Whenever you lose the game" uses the same parser family and
+    /// scopes the losing player to the trigger controller.
+    #[test]
+    fn trigger_you_lose_the_game() {
+        let def = parse_trigger_line(
+            "When you lose the game, draw a card.",
+            "Platinum Contraption",
+        );
+        assert_eq!(def.mode, TriggerMode::LosesGame);
+        assert_eq!(def.valid_target, Some(TargetFilter::Controller));
     }
 
     /// CR 701.30b-c: "Whenever you clash" scopes to the trigger controller as
