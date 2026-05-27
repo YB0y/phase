@@ -140,11 +140,13 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
 
     // --- "~ enters the battlefield tapped" (unconditional) ---
     // Guard: reject text with " unless " or "if you control" — all conditional
-    // patterns must be handled above.
+    // patterns must be handled above. Counter-bearing variants fall through to
+    // `parse_enters_with_counters`, which composes the tap and counter modifiers.
     if (nom_primitives::scan_contains(&norm_lower, "enters the battlefield tapped")
         || nom_primitives::scan_contains(&norm_lower, "enters tapped"))
         && !nom_primitives::scan_contains(&norm_lower, "unless")
         && !nom_primitives::scan_contains(&norm_lower, "if you control")
+        && !has_enters_tapped_with_counter(&norm_lower)
     {
         return Some(
             ReplacementDefinition::new(ReplacementEvent::Moved)
@@ -1733,6 +1735,17 @@ fn parse_enters_with_counters(
     let put_counter = build_enters_counter_ability(
         counter_entries.unwrap_or_else(|| vec![(counter_type, count_expr)]),
     );
+    let execute = if has_enters_tapped_phrase(work_text) {
+        AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Tap {
+                target: TargetFilter::SelfRef,
+            },
+        )
+        .sub_ability(put_counter)
+    } else {
+        put_counter
+    };
 
     // Determine valid_card filter: self vs other permanents.
     // CR 614.1c: "each other Angel you control enters with ..." is a
@@ -1792,7 +1805,7 @@ fn parse_enters_with_counters(
         ReplacementEvent::Moved
     };
     let mut def = ReplacementDefinition::new(event)
-        .execute(put_counter)
+        .execute(execute)
         .description(original_text.to_string());
     if let Some(filter) = valid_card {
         def = def.valid_card(filter);
@@ -1826,6 +1839,31 @@ fn parse_enters_with_counters(
     }
 
     Some(def)
+}
+
+fn has_enters_tapped_with_counter(text: &str) -> bool {
+    has_enters_tapped_phrase(text)
+        && preceded(
+            take_until::<_, _, OracleError<'_>>("counter"),
+            tag::<_, _, OracleError<'_>>("counter"),
+        )
+        .parse(text)
+        .is_ok()
+}
+
+fn has_enters_tapped_phrase(text: &str) -> bool {
+    alt((
+        preceded(
+            take_until::<_, _, OracleError<'_>>("enters the battlefield tapped"),
+            tag::<_, _, OracleError<'_>>("enters the battlefield tapped"),
+        ),
+        preceded(
+            take_until::<_, _, OracleError<'_>>("enters tapped"),
+            tag::<_, _, OracleError<'_>>("enters tapped"),
+        ),
+    ))
+    .parse(text)
+    .is_ok()
 }
 
 fn parse_enters_with_where_x_suffix(text: &str) -> Option<QuantityExpr> {
@@ -6513,6 +6551,34 @@ mod tests {
             Effect::Tap {
                 target: TargetFilter::SelfRef
             }
+        ));
+    }
+
+    #[test]
+    fn self_enters_tapped_with_counter_composes_modifiers() {
+        let def = parse_replacement_line(
+            "This creature enters tapped with a stun counter on it.",
+            "Tonberry",
+        )
+        .unwrap();
+
+        assert_eq!(def.event, ReplacementEvent::Moved);
+        assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+        let execute = def.execute.as_ref().expect("execute ability");
+        assert!(matches!(
+            *execute.effect,
+            Effect::Tap {
+                target: TargetFilter::SelfRef
+            }
+        ));
+        let sub = execute.sub_ability.as_ref().expect("counter sub_ability");
+        assert!(matches!(
+            *sub.effect,
+            Effect::PutCounter {
+                ref counter_type,
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::SelfRef,
+            } if *counter_type == CounterType::Stun
         ));
     }
 

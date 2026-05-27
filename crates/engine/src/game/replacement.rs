@@ -3045,10 +3045,18 @@ impl EventModifiers {
     /// An ability that is *purely* a Tap SelfRef / PutCounter-SelfRef / ChangeZone has no
     /// remaining work after its modifiers are applied to the event.
     fn has_only_event_modifier(ability: Option<&AbilityDefinition>) -> bool {
-        let Some(def) = ability else {
+        let Some(mut current) = ability else {
             return false;
         };
-        Self::is_event_modifier_effect(&def.effect) && def.sub_ability.is_none()
+        loop {
+            if !Self::is_event_modifier_effect(&current.effect) {
+                return false;
+            }
+            let Some(next) = current.sub_ability.as_deref() else {
+                return true;
+            };
+            current = next;
+        }
     }
 
     /// CR 614.1c: Walk the ability's sub_ability chain and find the first effect
@@ -4050,6 +4058,48 @@ mod tests {
                 (CounterType::Plus1Plus1, 1),
                 (CounterType::Generic("shield".to_string()), 1)
             ]
+        );
+    }
+
+    #[test]
+    fn chained_etb_modifiers_do_not_stash_post_replacement_continuation() {
+        let mut enter_tapped = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Tap {
+                target: TargetFilter::SelfRef,
+            },
+        );
+        enter_tapped.sub_ability = Some(Box::new(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::PutCounter {
+                counter_type: CounterType::Stun,
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::SelfRef,
+            },
+        )));
+        let repl = ReplacementDefinition::new(ReplacementEvent::Moved)
+            .execute(enter_tapped)
+            .valid_card(TargetFilter::SelfRef);
+        let mut state = test_state_with_object(ObjectId(10), Zone::Hand, vec![repl]);
+        let mut events = Vec::new();
+        let proposed =
+            ProposedEvent::zone_change(ObjectId(10), Zone::Hand, Zone::Battlefield, None);
+
+        let result = replace_event(&mut state, proposed, &mut events);
+        let ReplacementResult::Execute(ProposedEvent::ZoneChange {
+            enter_tapped,
+            enter_with_counters,
+            ..
+        }) = result
+        else {
+            panic!("expected Execute with ZoneChange, got {result:?}");
+        };
+
+        assert!(enter_tapped.resolve(false));
+        assert_eq!(enter_with_counters, vec![(CounterType::Stun, 1)]);
+        assert!(
+            state.post_replacement_continuation.is_none(),
+            "pure ETB modifier chains must not be replayed after the event"
         );
     }
 
