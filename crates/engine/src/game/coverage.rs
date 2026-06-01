@@ -11,11 +11,11 @@ use crate::types::ability::{
     AdditionalCost, AggregateFunction, CardTypeSetSource, ChoiceType, Comparator,
     ContinuousModification, ControllerRef, CountScope, CounterSourceRider, DelayedTriggerCondition,
     DieRollModifier, DoublePTMode, Duration, Effect, EffectOutcomeSignal, FilterProp,
-    GainLifePlayer, GameRestriction, ManaProduction, ObjectProperty, ObjectScope, PlayerFilter,
-    PlayerScope, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef, ReplacementCondition,
-    ReplacementDefinition, ReplacementMode, SharedQuality, SharedQualityRelation, SpeedDelta,
-    SpellCastingOption, SpellCastingOptionKind, StaticCondition, StaticDefinition, TargetFilter,
-    TriggerDefinition, TypeFilter, TypedFilter, ZoneRef,
+    GameRestriction, ManaProduction, ObjectProperty, ObjectScope, PlayerFilter, PlayerScope,
+    PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef, ReplacementCondition,
+    ReplacementDefinition, ReplacementMode, SeatDirection, SharedQuality, SharedQualityRelation,
+    SpeedDelta, SpellCastingOption, SpellCastingOptionKind, StaticCondition, StaticDefinition,
+    TargetFilter, TriggerDefinition, TypeFilter, TypedFilter, ZoneRef,
 };
 use crate::types::card::CardFace;
 use crate::types::card_type::CoreType;
@@ -24,7 +24,7 @@ use crate::types::keywords::Keyword;
 use crate::types::mana::{ManaColor, ManaCost, ManaCostShard};
 use crate::types::phase::Phase;
 use crate::types::replacements::ReplacementEvent;
-use crate::types::statics::StaticMode;
+use crate::types::statics::{CostModifyMode, StaticMode};
 use crate::types::triggers::TriggerMode;
 use crate::types::zones::Zone;
 use nom::bytes::complete::tag;
@@ -41,9 +41,7 @@ fn is_data_carrying_static(mode: &StaticMode) -> bool {
         StaticMode::ReduceAbilityCost { .. }
             | StaticMode::ModifyActivationLimit { .. }
             | StaticMode::AdditionalLandDrop { .. }
-            | StaticMode::ReduceCost { .. }
-            | StaticMode::RaiseCost { .. }
-            | StaticMode::MinimumCost { .. }
+            | StaticMode::ModifyCost { .. }
             | StaticMode::DefilerCostReduction { .. }
             | StaticMode::CantPayCost { .. }
             | StaticMode::CantBeCast { .. }
@@ -365,6 +363,10 @@ fn fmt_target(filter: &TargetFilter) -> String {
         TargetFilter::PostReplacementDamageTarget => "prevented damage target".into(),
         TargetFilter::SpecificObject { id } => format!("object #{}", id.0),
         TargetFilter::SpecificPlayer { id } => format!("player #{}", id.0),
+        TargetFilter::Neighbor { direction } => match direction {
+            SeatDirection::Left => "player to your left".into(),
+            SeatDirection::Right => "player to your right".into(),
+        },
         TargetFilter::TrackedSet { id } => format!("tracked set #{}", id.0),
         TargetFilter::TrackedSetFiltered { id, filter } => {
             format!("tracked set #{} matching {}", id.0, fmt_target(filter))
@@ -770,6 +772,9 @@ fn fmt_duration(d: &Duration) -> String {
         Duration::UntilEndOfCombat => "until end of combat".to_string(),
         Duration::UntilNextTurnOf { player } => {
             format!("until next turn ({})", fmt_player_scope(player))
+        }
+        Duration::UntilEndOfNextTurnOf { player } => {
+            format!("until end of next turn ({})", fmt_player_scope(player))
         }
         Duration::UntilHostLeavesPlay => "while on battlefield".to_string(),
         Duration::UntilNextStepOf { step, player } => {
@@ -1769,16 +1774,8 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         }
         Effect::GainLife { amount, player } => {
             d.push(("amount".into(), fmt_quantity(amount)));
-            if !matches!(player, GainLifePlayer::Controller) {
-                d.push((
-                    "player".into(),
-                    match player {
-                        GainLifePlayer::TargetedController => "target's controller",
-                        GainLifePlayer::TargetPlayer => "target player",
-                        GainLifePlayer::Controller => unreachable!(),
-                    }
-                    .into(),
-                ));
+            if !player.is_context_ref() {
+                d.push(("player".into(), fmt_target(player)));
             }
         }
         Effect::LoseLife { amount, .. } => {
@@ -6510,19 +6507,21 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
                 effective_lower.contains("play with the top card")
                     || effective_lower.contains("play with the top")
             }
-            StaticMode::ReduceCost { .. } => {
-                effective_lower.contains("cost") && effective_lower.contains("less")
-            }
-            StaticMode::RaiseCost { .. } => {
-                effective_lower.contains("cost") && effective_lower.contains("more")
-            }
-            // CR 601.2f: Trinisphere class — "each spell that would cost less than N
-            // mana to cast costs N mana to cast." Coverage marker: "would cost less than"
-            // is the discriminator from RaiseCost ("more"), ReduceCost ("less to cast").
-            StaticMode::MinimumCost { .. } => {
-                effective_lower.contains("would cost less than")
-                    && effective_lower.contains("mana to cast")
-            }
+            // CR 601.2f: ReduceCost / RaiseCost / MinimumCost coverage markers,
+            // discriminated by the `mode` axis. Trinisphere's "would cost less than"
+            // distinguishes Minimum from Reduce ("less to cast") and Raise ("more").
+            StaticMode::ModifyCost { mode, .. } => match mode {
+                CostModifyMode::Reduce => {
+                    effective_lower.contains("cost") && effective_lower.contains("less")
+                }
+                CostModifyMode::Raise => {
+                    effective_lower.contains("cost") && effective_lower.contains("more")
+                }
+                CostModifyMode::Minimum => {
+                    effective_lower.contains("would cost less than")
+                        && effective_lower.contains("mana to cast")
+                }
+            },
             StaticMode::CantBeCountered => effective_lower.contains("can't be countered"),
             StaticMode::CantBeCopied => effective_lower.contains("can't be copied"),
             // CR 119.7: "can't gain life" or its compound form "life total can't change"
