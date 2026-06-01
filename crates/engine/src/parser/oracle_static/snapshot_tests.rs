@@ -626,7 +626,7 @@ fn parses_splinter_source_restricted_doubler() {
     }
 }
 
-/// CR 205.3a + CR 603.2d: A disjunctive source ("a Shaman or another Wizard
+/// CR 603.2d: A disjunctive source ("a Shaman or another Wizard
 /// you control", Harmonic Prodigy) is a top-level type union sharing one
 /// trailing controller scope. The doubler `affected` filter MUST be the
 /// controller-scoped `Or` of both disjuncts — doubling triggers from a Shaman
@@ -736,7 +736,7 @@ fn panharmonicon_doubler_has_no_source_filter() {
     );
 }
 
-/// CR 205.3a: Echoes of Eternity — a second real disjunctive doubler beyond
+/// CR 603.2d: Echoes of Eternity — a second real disjunctive doubler beyond
 /// Harmonic Prodigy. "a colorless spell you control or another colorless
 /// permanent you control" must produce a controller-scoped two-branch `Or`, with
 /// the trailing "another ... permanent" disjunct carrying FilterProp::Another.
@@ -818,7 +818,7 @@ fn delney_power_suffix_or_is_not_a_disjunction() {
     );
 }
 
-/// CR 205.3a: A three-way Oxford-comma type union exercises the `, or ` and bare
+/// CR 603.2d: A three-way Oxford-comma type union exercises the `, or ` and bare
 /// `, ` connector arms of `doubler_disjunct_connector`. No live card uses them
 /// yet, but they share the union path with the two-way "or" form — this locks
 /// them so a future simplification dropping those arms is caught. Each of the

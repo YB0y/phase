@@ -82,7 +82,7 @@ pub(crate) fn classify_block_exception(filter_text: &str) -> BlockExceptionKind 
 /// `apply_trigger_doubling`'s controller match already enforces control — so
 /// this returns `None`, leaving `affected` unset (Panharmonicon/Isshin/Drivnod).
 ///
-/// CR 205.3a: The source may itself be a flat disjunction of typed clauses
+/// CR 603.2d: The source may itself be a flat disjunction of typed clauses
 /// sharing one trailing controller scope — "a Shaman or another Wizard you
 /// control" (Harmonic Prodigy). Such sources are composed into a
 /// controller-scoped `Or`, one disjunct per [`doubler_disjunct_connector`].
@@ -109,7 +109,7 @@ pub(crate) fn parse_doubler_source_filter(lower: &str) -> Option<TargetFilter> {
         return None;
     }
 
-    // CR 205.3a: The source may be a flat type union sharing one trailing
+    // CR 603.2d: The source may be a flat type union sharing one trailing
     // controller scope — "a Shaman or another Wizard you control" (Harmonic
     // Prodigy). `parse_type_phrase`'s own disjunction recursion only fires when
     // the trailing disjunct opens with a bare type word, not an article or an
@@ -149,7 +149,7 @@ pub(crate) fn parse_doubler_source_filter(lower: &str) -> Option<TargetFilter> {
     }))
 }
 
-/// CR 205.3a: Match the connector between two typed disjuncts in a flat union —
+/// CR 603.2d: Match the connector between two typed disjuncts in a flat union —
 /// "or", the Oxford-comma "`, or`", or a bare list comma "`, `"
 /// ("a Shaman, a Wizard, or a Cleric"). Longest-match-first so "`, or`" wins
 /// over the bare "`, `". Combinator-based so the union is parsed, not
