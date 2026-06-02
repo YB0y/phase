@@ -337,6 +337,7 @@ const ANAPHORIC_SCOPE_CARDS: &[&str] = &[
     "sin prodder",
     "singe-mind ogre",
     "sister hospitaller",
+    "sly spy",
     "solitude",
     "sorin the mirthless",
     "sorin, grim nemesis",
@@ -451,8 +452,8 @@ fn anaphoric_scope_set_is_frozen() {
     // both this and ANAPHORIC_SCOPE_CARDS shrink together.
     assert_eq!(
         observed.len(),
-        257,
-        "Expected exactly 257 cards retaining ObjectScope::Anaphoric. PR #1451 \
+        258,
+        "Expected exactly 258 cards retaining ObjectScope::Anaphoric. PR #1451 \
          re-scoped 8 dynamic-quantity 'its power' anaphora off the Anaphoric \
          arm onto typed quantity refs; PR #1522 re-scoped Dead Before Sunrise \
          through the recipient/subject rewrite. Count moved to {}.",
@@ -460,8 +461,8 @@ fn anaphoric_scope_set_is_frozen() {
     );
     assert_eq!(
         ANAPHORIC_SCOPE_CARDS.len(),
-        257,
-        "ANAPHORIC_SCOPE_CARDS must list exactly 257 cards."
+        258,
+        "ANAPHORIC_SCOPE_CARDS must list exactly 258 cards."
     );
 }
 
