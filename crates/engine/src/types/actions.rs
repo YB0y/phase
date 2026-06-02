@@ -25,9 +25,10 @@ use crate::game::game_object::AttachTarget;
 #[serde(tag = "type")]
 pub enum CastChoice {
     /// CR 701.57a + CR 702.85a: Cast the offered card without paying its mana
-    /// cost. The cast pipeline still enforces target legality, alternative
-    /// constraints (e.g., `CascadeResultingMvBelow`), and other CR 601.2
-    /// checks.
+    /// cost. The cast pipeline still enforces target legality, the
+    /// cast-during-resolution resulting-MV constraint (`ManaValue` carried on
+    /// the `ExileWithAltCost` permission with `resolution_cleanup`), and other
+    /// CR 601.2 checks.
     Cast,
     /// CR 701.57a + CR 702.85a: Decline the offer. For Discover the card goes
     /// to hand; for Cascade the card joins the misses on the bottom of the
@@ -153,6 +154,12 @@ pub enum GameAction {
     ChooseExert {
         exert: bool,
     },
+    /// CR 701.30b: The clashing player's choice of which opponent to clash with,
+    /// answering a pending `WaitingFor::ClashChooseOpponent`. `opponent` must be
+    /// one of that prompt's `candidates`.
+    ChooseClashOpponent {
+        opponent: PlayerId,
+    },
     /// CR 103.5 + 103.5b: A player's decision at a `WaitingFor::MulliganDecision`
     /// prompt. See [`MulliganChoice`] for the three branches.
     MulliganDecision {
@@ -180,6 +187,11 @@ pub enum GameAction {
     },
     SelectCards {
         cards: Vec<ObjectId>,
+    },
+    /// CR 705.1: Krark's Thumb keep-choice — indices into `results` the player
+    /// keeps (ignoring the rest, CR 614.1a). Length must equal `keep_count`.
+    SelectCoinFlips {
+        keep_indices: Vec<usize>,
     },
     /// CR 400.11 + CR 406.3: Player commits one or more selections from the
     /// offered outside-game pool. Each selection is a discriminated source —
@@ -707,6 +719,12 @@ pub enum DebugAction {
     },
     /// Tap or untap an object.
     SetTapped { object_id: ObjectId, tapped: bool },
+    /// CR 722.3a: Give or remove the "prepared" designation on an object so a
+    /// preparation card's prepare spell can be cast for testing. Routes through
+    /// the `game::effects::prepare` single authority, so setting `prepared`
+    /// no-ops on objects without a prepare-spell face and emits the
+    /// `BecamePrepared` / `BecameUnprepared` events.
+    SetPrepared { object_id: ObjectId, prepared: bool },
     /// Change an object's controller. Marks layers dirty.
     SetController {
         object_id: ObjectId,
@@ -945,6 +963,14 @@ impl DebugAction {
                 obj(*object_id),
                 if *tapped { "tapped" } else { "untapped" }
             ),
+            DebugAction::SetPrepared {
+                object_id,
+                prepared,
+            } => format!(
+                "SetPrepared ({} → {})",
+                obj(*object_id),
+                if *prepared { "prepared" } else { "unprepared" }
+            ),
             DebugAction::SetController {
                 object_id,
                 controller,
@@ -1120,6 +1146,7 @@ impl GameAction {
             | GameAction::MulliganDecision { .. }
             | GameAction::ReorderHand { .. }
             | GameAction::SelectCards { .. }
+            | GameAction::SelectCoinFlips { .. }
             | GameAction::ChooseOutsideGameCards { .. }
             | GameAction::SelectTargets { .. }
             | GameAction::ChooseTarget { .. }
@@ -1153,6 +1180,7 @@ impl GameAction {
             | GameAction::DiscoverChoice { .. }
             | GameAction::CascadeChoice { .. }
             | GameAction::ChooseTopOrBottom { .. }
+            | GameAction::ChooseClashOpponent { .. }
             | GameAction::ChooseBattleProtector { .. }
             | GameAction::SetAutoPass { .. }
             | GameAction::CancelAutoPass

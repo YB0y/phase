@@ -315,6 +315,17 @@ pub(super) fn handle_replacement_choice(
                     );
                     state.pending_step_end_mana_handlers.clear();
                 }
+                // CR 705.1 + CR 614.1a: Coin-flip replacements (Krark's Thumb)
+                // are always Mandatory and applied inline by
+                // `flip_coin::flip_through_replacement`; they never reach the
+                // optional replacement-choice resume path. Unreachable in
+                // practice — present only for match exhaustiveness.
+                ProposedEvent::CoinFlip { .. } => {
+                    debug_assert!(
+                        false,
+                        "CoinFlip replacement reached the optional-choice resume path"
+                    );
+                }
             }
 
             let mut waiting_for = WaitingFor::Priority {
@@ -1296,6 +1307,7 @@ mod tests {
             from: Zone::Battlefield,
             to: Zone::Exile,
             cause: None,
+            attach_to: None,
             enter_tapped: crate::types::proposed_event::EtbTapState::Unspecified,
             enter_with_counters: Vec::new(),
             controller_override: None,
@@ -1797,6 +1809,7 @@ mod tests {
             from: Zone::Stack,
             to: Zone::Battlefield,
             cause: None,
+            attach_to: None,
             enter_tapped: crate::types::proposed_event::EtbTapState::Unspecified,
             enter_with_counters: Vec::new(),
             controller_override: None,
@@ -1974,6 +1987,7 @@ mod tests {
             from: Zone::Stack,
             to: Zone::Battlefield,
             cause: None,
+            attach_to: None,
             enter_tapped: crate::types::proposed_event::EtbTapState::Unspecified,
             enter_with_counters: Vec::new(),
             controller_override: None,
@@ -2117,7 +2131,7 @@ mod tests {
                 AbilityKind::Spell,
                 Effect::GainLife {
                     amount: QuantityExpr::Fixed { value: 3 },
-                    player: crate::types::ability::GainLifePlayer::Controller,
+                    player: crate::types::ability::TargetFilter::Controller,
                 },
             ),
             AbilityDefinition::new(

@@ -22,6 +22,7 @@ use super::{casting, casting_costs};
 
 pub(super) enum ResolutionChoiceOutcome {
     WaitingFor(WaitingFor),
+    WaitingForWithInlineTriggers(WaitingFor),
     ActionResult(ActionResult),
 }
 
@@ -41,11 +42,24 @@ fn batch_or_drain_observer_triggers(
     events: &mut Vec<GameEvent>,
     event_slice_start: usize,
     event_slice_end: usize,
-) -> Option<WaitingFor> {
+) -> Option<ResolutionChoiceOutcome> {
     if matches!(state.waiting_for, WaitingFor::Priority { .. }) {
-        // B1: this action settled — `run_post_action_pipeline` scans this
-        // action's own events; only the prior parked queue needs draining.
-        super::triggers::drain_deferred_trigger_queue(state, events)
+        // B1: this action settled. Merge this slice's observer triggers into
+        // the parked queue before draining — otherwise the last segment's
+        // triggers (e.g. the final Syphon Mind opponent discard) never enter
+        // `deferred_triggers` and are lost when ordering runs (issue #1793).
+        let trigger_events: Vec<GameEvent> = events[event_slice_start..event_slice_end]
+            .iter()
+            .filter(|ev| !matches!(ev, GameEvent::PhaseChanged { .. }))
+            .cloned()
+            .collect();
+        super::triggers::collect_triggers_into_deferred(state, &trigger_events);
+        if let Some(wf) = super::triggers::drain_deferred_trigger_queue(state, events) {
+            return Some(ResolutionChoiceOutcome::WaitingFor(wf));
+        }
+        Some(ResolutionChoiceOutcome::WaitingForWithInlineTriggers(
+            state.waiting_for.clone(),
+        ))
     } else {
         // B2: paused — `run_post_action_pipeline` will not scan this action.
         // Park this move's observer triggers for a later settle.
@@ -63,6 +77,7 @@ pub(super) fn handles(waiting_for: &WaitingFor) -> bool {
     matches!(
         waiting_for,
         WaitingFor::ScryChoice { .. }
+            | WaitingFor::CoinFlipKeepChoice { .. }
             | WaitingFor::ManifestDreadChoice { .. }
             | WaitingFor::CastOffer {
                 kind: CastOfferKind::Discover { .. },
@@ -77,6 +92,7 @@ pub(super) fn handles(waiting_for: &WaitingFor) -> bool {
             | WaitingFor::LearnChoice { .. }
             | WaitingFor::TopOrBottomChoice { .. }
             | WaitingFor::PopulateChoice { .. }
+            | WaitingFor::ClashChooseOpponent { .. }
             | WaitingFor::ClashCardPlacement { .. }
             | WaitingFor::VoteChoice { .. }
             | WaitingFor::SeparatePilesPartition { .. }
@@ -286,6 +302,50 @@ pub(super) fn handle_resolution_choice(
             ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))
         }
         (
+            WaitingFor::CoinFlipKeepChoice {
+                player,
+                results,
+                keep_count,
+            },
+            GameAction::SelectCoinFlips { keep_indices },
+        ) => {
+            // CR 614.1a + CR 705.1: the player must keep exactly `keep_count`
+            // distinct, in-range flips and ignore the rest.
+            if keep_indices.len() != keep_count {
+                return Err(EngineError::InvalidAction(format!(
+                    "Must keep exactly {keep_count} coin flip(s), got {}",
+                    keep_indices.len()
+                )));
+            }
+            let mut seen = std::collections::HashSet::new();
+            for &index in &keep_indices {
+                if index >= results.len() {
+                    return Err(EngineError::InvalidAction(format!(
+                        "Coin flip index {index} out of range"
+                    )));
+                }
+                if !seen.insert(index) {
+                    return Err(EngineError::InvalidAction(format!(
+                        "Duplicate coin flip index {index}"
+                    )));
+                }
+            }
+            let kept: Vec<bool> = keep_indices.iter().map(|&index| results[index]).collect();
+            let pending = state.pending_coin_flip.take().ok_or_else(|| {
+                EngineError::InvalidAction("No pending coin flip to resume".to_string())
+            })?;
+            let next =
+                crate::game::effects::flip_coin::resume_after_keep(state, pending, kept, events)
+                    .map_err(|error| EngineError::InvalidAction(format!("{error}")))?;
+            // CR 608.2c: re-suspended for another interactive choice, else the
+            // whole flip effect completed — drain back to Priority.
+            let wf = match next {
+                Some(wf) => wf,
+                None => finish_with_continuation(state, player, events),
+            };
+            ResolutionChoiceOutcome::WaitingFor(wf)
+        }
+        (
             WaitingFor::ManifestDreadChoice { player, cards },
             GameAction::SelectCards {
                 cards: selected_cards,
@@ -324,39 +384,53 @@ pub(super) fn handle_resolution_choice(
                     CastOfferKind::Discover {
                         hit_card,
                         exiled_misses,
+                        discover_value,
                     },
             },
             GameAction::DiscoverChoice { choice },
         ) => {
             let cast = matches!(choice, crate::types::actions::CastChoice::Cast);
             if cast {
-                if let Some(obj) = state.objects.get_mut(&hit_card) {
-                    obj.casting_permissions.push(
-                        crate::types::ability::CastingPermission::ExileWithAltCost {
-                            cost: crate::types::mana::ManaCost::zero(),
-                            cast_transformed: false,
-                            constraint: None,
-                            // CR 702.190a (Discover): the discovering player is
-                            // the only player permitted to cast the hit card.
-                            granted_to: Some(player),
+                // CR 701.57a + CR 608.2g: cast the hit DURING resolution, gated
+                // by "resulting spell's mana value is less than or equal to N".
+                // The MV check is re-evaluated at finalization (after X), and on
+                // rejection the hit goes to the discovering player's hand
+                // (`ToHand`) while the misses go to the library bottom.
+                let cleanup = crate::types::ability::ResolutionCastCleanup {
+                    exiled_misses,
+                    reject_action: crate::types::ability::ResolutionMvRejectAction::ToHand,
+                };
+                let result = casting::initiate_cast_during_resolution(
+                    state,
+                    player,
+                    hit_card,
+                    Some(crate::types::ability::CastPermissionConstraint::ManaValue {
+                        comparator: crate::types::ability::Comparator::LE,
+                        value: QuantityExpr::Fixed {
+                            value: discover_value as i32,
                         },
-                    );
-                }
+                    }),
+                    cleanup,
+                    events,
+                )?;
+                ResolutionChoiceOutcome::WaitingFor(result)
             } else {
+                // CR 701.57a: decline — hit goes to the discovering player's
+                // hand; the misses go to the library bottom in a random order.
                 zones::move_to_zone(state, hit_card, Zone::Hand, events);
-            }
 
-            {
-                use rand::seq::SliceRandom;
+                {
+                    use rand::seq::SliceRandom;
 
-                let mut shuffled = exiled_misses;
-                shuffled.shuffle(&mut state.rng);
-                for card_id in shuffled {
-                    zones::move_to_library_position(state, card_id, false, events);
+                    let mut shuffled = exiled_misses;
+                    shuffled.shuffle(&mut state.rng);
+                    for card_id in shuffled {
+                        zones::move_to_library_position(state, card_id, false, events);
+                    }
                 }
-            }
 
-            ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))
+                ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))
+            }
         }
         // CR 701.20a + CR 608.2c: "You may put that card onto the battlefield" —
         // the controller routes the kept card after RevealUntil found a hit.
@@ -448,37 +522,39 @@ pub(super) fn handle_resolution_choice(
         ) => {
             let cast = matches!(choice, crate::types::actions::CastChoice::Cast);
             if cast {
-                // CR 702.85a: Grant a cast-from-exile permission gated by
-                // `CascadeResultingMvBelow`. The second MV check is enforced
-                // at cast time in `casting_costs`, where X has been chosen.
-                // Bottom-shuffle of misses is deferred to that point so a
-                // cast-time rejection can still reach them.
-                if let Some(obj) = state.objects.get_mut(&hit_card) {
-                    obj.casting_permissions.push(
-                        crate::types::ability::CastingPermission::ExileWithAltCost {
-                            cost: crate::types::mana::ManaCost::zero(),
-                            cast_transformed: false,
-                            constraint: Some(
-                                crate::types::ability::CastPermissionConstraint::CascadeResultingMvBelow {
-                                    source_mv,
-                                    exiled_misses,
-                                },
-                            ),
-                            // CR 702.85a (Cascade): the cascading player is the
-                            // only player permitted to cast the hit card.
-                            granted_to: Some(player),
+                // CR 702.85a + CR 608.2g: cast the hit DURING resolution, gated
+                // by "resulting spell's mana value is less than this spell's
+                // mana value". The MV check is re-evaluated at finalization
+                // (after X), and on rejection the hit joins the misses on the
+                // library bottom (`BottomWithMisses`).
+                let cleanup = crate::types::ability::ResolutionCastCleanup {
+                    exiled_misses,
+                    reject_action:
+                        crate::types::ability::ResolutionMvRejectAction::BottomWithMisses,
+                };
+                let result = casting::initiate_cast_during_resolution(
+                    state,
+                    player,
+                    hit_card,
+                    Some(crate::types::ability::CastPermissionConstraint::ManaValue {
+                        comparator: crate::types::ability::Comparator::LT,
+                        value: QuantityExpr::Fixed {
+                            value: source_mv as i32,
                         },
-                    );
-                }
+                    }),
+                    cleanup,
+                    events,
+                )?;
+                ResolutionChoiceOutcome::WaitingFor(result)
             } else {
                 // CR 702.85a: Caster declines — hit and misses all go to the
                 // bottom of the library in a random order together.
                 let mut all_to_bottom = exiled_misses;
                 all_to_bottom.push(hit_card);
                 crate::game::effects::cascade::shuffle_to_bottom(state, &all_to_bottom, events);
-            }
 
-            ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))
+                ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))
+            }
         }
         (WaitingFor::LearnChoice { player, hand_cards }, GameAction::LearnDecision { choice }) => {
             match choice {
@@ -645,6 +721,33 @@ pub(super) fn handle_resolution_choice(
             );
             let _ = effects::populate::create_token_copy(state, token_id, &dummy_ability, events);
             ResolutionChoiceOutcome::WaitingFor(finish_with_continuation(state, player, events))
+        }
+        (
+            WaitingFor::ClashChooseOpponent {
+                player,
+                candidates,
+                ability,
+            },
+            GameAction::ChooseClashOpponent { opponent },
+        ) => {
+            // CR 701.30b: The chosen opponent must be one of the offered
+            // candidates (a non-eliminated opponent of the clashing player).
+            if !candidates.contains(&opponent) {
+                return Err(EngineError::InvalidAction(format!(
+                    "Chosen clash opponent {opponent:?} is not a legal opponent"
+                )));
+            }
+            effects::clash::perform_clash(state, &ability, opponent, events)
+                .map_err(|e| EngineError::InvalidAction(format!("{e:?}")))?;
+            // CR 701.30a: With at least one revealed card, `perform_clash` queued
+            // the APNAP placement (which drains the clash's sub_ability). With
+            // both libraries empty, no placement was queued, so drain the stashed
+            // sub_ability here and hand priority back to the clashing player.
+            if !matches!(state.waiting_for, WaitingFor::ClashCardPlacement { .. }) {
+                set_priority(state, player);
+                effects::drain_pending_continuation(state, events);
+            }
+            ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())
         }
         (
             WaitingFor::ClashCardPlacement {
@@ -1390,6 +1493,12 @@ pub(super) fn handle_resolution_choice(
                                     state.waiting_for.clone(),
                                 ));
                             }
+                            effects::change_zone::ZoneMoveResult::NeedsAuraAttachmentChoice => {
+                                return Ok(action_result_outcome(
+                                    events,
+                                    state.waiting_for.clone(),
+                                ));
+                            }
                         }
                     }
                 }
@@ -1763,13 +1872,13 @@ pub(super) fn handle_resolution_choice(
             // action, so batch this discard's observer triggers (Waste Not,
             // Megrim, Bone Miser) across the `DiscardChoice` pause — exactly
             // as the `Sacrifice` branch does for dies-triggers.
-            if let Some(wf) = batch_or_drain_observer_triggers(
+            if let Some(outcome) = batch_or_drain_observer_triggers(
                 state,
                 events,
                 events_before_effect,
                 events_after_move,
             ) {
-                return Ok(ResolutionChoiceOutcome::WaitingFor(wf));
+                return Ok(outcome);
             }
             ResolutionChoiceOutcome::WaitingFor(waiting_for)
         }
@@ -1898,6 +2007,28 @@ pub(super) fn handle_resolution_choice(
                             state, &ctx, *card_id, events,
                         ) {
                             effects::change_zone::ZoneMoveResult::Done => {}
+                            effects::change_zone::ZoneMoveResult::NeedsAuraAttachmentChoice => {
+                                state.pending_change_zone_iteration =
+                                    Some(crate::types::game_state::PendingChangeZoneIteration {
+                                        remaining: chosen_ids[i + 1..].to_vec(),
+                                        source_id: ctx.source_id,
+                                        controller: ctx.controller,
+                                        origin: ctx.origin,
+                                        destination: ctx.destination,
+                                        enter_transformed: ctx.enter_transformed,
+                                        enter_tapped: ctx.enter_tapped,
+                                        enters_under_player: ctx.enters_under_player,
+                                        enters_attacking: ctx.enters_attacking,
+                                        enter_with_counters: ctx.enter_with_counters.clone(),
+                                        duration: ctx.duration.clone(),
+                                        track_exiled_by_source: ctx.track_exiled_by_source,
+                                        effect_kind,
+                                    });
+                                return Ok(action_result_outcome(
+                                    events,
+                                    state.waiting_for.clone(),
+                                ));
+                            }
                             effects::change_zone::ZoneMoveResult::NeedsChoice(choice_player) => {
                                 // CR 614.12b + CR 614.1c + CR 614.13: stash the
                                 // unprocessed cards so the drain in
@@ -2096,13 +2227,13 @@ pub(super) fn handle_resolution_choice(
                     &mut events[events_before_effect..events_after_move],
                     &super::zones::departed_subset(state, &chosen),
                 );
-                if let Some(wf) = batch_or_drain_observer_triggers(
+                if let Some(outcome) = batch_or_drain_observer_triggers(
                     state,
                     events,
                     events_before_effect,
                     events_after_move,
                 ) {
-                    return Ok(ResolutionChoiceOutcome::WaitingFor(wf));
+                    return Ok(outcome);
                 }
             }
             ResolutionChoiceOutcome::WaitingFor(state.waiting_for.clone())

@@ -558,6 +558,13 @@ pub(crate) fn parse_static_line_multi_inner(text: &str) -> Vec<StaticDefinition>
         return defs;
     }
 
+    // CR 509.1b: "<predicate> and can block an additional creature [each combat]"
+    // pairs a keyword/continuous grant with an extra-block grant under one
+    // subject (Brave the Sands). Split so the extra-block clause is not dropped.
+    if let Some(defs) = try_split_and_can_block_additional(&stripped) {
+        return defs;
+    }
+
     // CR 509.1b + CR 604.1 + CR 611.3a + CR 613.1f: Attached-subject grant lines
     // ("enchanted creature ...", "equipped creature ...") may decompose into more
     // than one StaticDefinition (e.g. CantBeBlocked + Continuous{AddKeyword}).
@@ -714,25 +721,10 @@ pub(crate) fn parse_static_condition(text: &str) -> Option<StaticCondition> {
         return Some(StaticCondition::SourceIsPaired);
     }
 
-    // "you have at least N life more than your starting life total"
-    if let Some(amount_text) = nom_tag_lower(tp.lower, tp.lower, "you have at least ")
-        // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-        .and_then(|s| s.strip_suffix(" life more than your starting life total"))
-    // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-    {
-        let (amount, rest) = parse_number(amount_text)?;
-        if rest.trim().is_empty() {
-            return Some(StaticCondition::QuantityComparison {
-                lhs: QuantityExpr::Ref {
-                    qty: QuantityRef::LifeAboveStarting,
-                },
-                comparator: Comparator::GE,
-                rhs: QuantityExpr::Fixed {
-                    value: amount as i32,
-                },
-            });
-        }
-    }
+    // Note: "you have at least N life more than your starting life total"
+    // (LifeAboveStarting ≥ N) is now owned by `parse_inner_condition` above
+    // (see `parse_you_have_conditions`), so both the static "as long as" gate
+    // and the trigger intervening-if share one parse path. No separate arm here.
 
     if tp.lower == "you have max speed" || tp.lower == "have max speed" {
         return Some(StaticCondition::HasMaxSpeed);

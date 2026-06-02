@@ -701,6 +701,7 @@ fn walk_effect(effect: &Effect, out: &mut Vec<String>) {
         | Effect::CastCopyOfCard { .. }
         | Effect::CopyTokenOf { .. }
         | Effect::Myriad
+        | Effect::CopyTokenBlockingAttacker { .. }
         | Effect::BecomeCopy { .. }
         | Effect::ChooseCard { .. }
         | Effect::PutCounter { .. }
@@ -1214,6 +1215,7 @@ mod tests {
             parse_warnings: vec![],
             brawl_commander: false,
             is_commander: false,
+            deck_copy_limit: None,
             metadata: Default::default(),
             rarities: Default::default(),
         }

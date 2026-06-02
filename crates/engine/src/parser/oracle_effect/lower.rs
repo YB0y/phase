@@ -41,15 +41,15 @@ use super::subject;
 use super::{
     append_to_deepest_sub_ability, apply_player_scope_rewrites,
     attach_alt_cost_to_prior_cast_from_zone, attach_mana_retention_to_prior_mana,
-    attach_same_is_true_keywords, collapse_ephemeral_color_choice_mana,
-    contains_explicit_tracked_set_pronoun, contains_implicit_tracked_set_pronoun,
-    fold_cast_copy_of_card_defs, has_explicit_player_target, mark_uses_tracked_set,
-    parse_effect_clause, parse_event_context_ref_with_ctx, parse_for_each_object_copy_parts,
-    publishes_tracked_set_from_resolution, refine_damage_target_remainder,
-    replace_player_anaphor_with_parent_target, rewrite_parent_targets_to_tracked_set,
-    rewrite_rounding_mode, rewrite_that_type_mana_instead, scan_contains_phrase,
-    stamp_delayed_returns, target_filter_controller_ref, try_fold_token_repeat_into_count,
-    wire_optional_cast_decline_fallback,
+    attach_repeat_process_keywords, attach_same_is_true_keywords,
+    collapse_ephemeral_color_choice_mana, contains_explicit_tracked_set_pronoun,
+    contains_implicit_tracked_set_pronoun, fold_cast_copy_of_card_defs, has_explicit_player_target,
+    mark_uses_tracked_set, parse_effect_clause, parse_event_context_ref_with_ctx,
+    parse_for_each_object_copy_parts, publishes_tracked_set_from_resolution,
+    refine_damage_target_remainder, replace_player_anaphor_with_parent_target,
+    rewrite_parent_targets_to_tracked_set, rewrite_rounding_mode, rewrite_that_type_mana_instead,
+    scan_contains_phrase, stamp_delayed_returns, target_filter_controller_ref,
+    try_fold_token_repeat_into_count, wire_optional_cast_decline_fallback,
 };
 
 fn rewrite_player_anaphor_targets_in_definition(def: &mut AbilityDefinition) {
@@ -321,6 +321,10 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
                     }
                     SpecialClause::SameIsTrueFor(keywords) => {
                         attach_same_is_true_keywords(&mut defs, keywords);
+                        true
+                    }
+                    SpecialClause::RepeatProcessForKeywords(keywords) => {
+                        attach_repeat_process_keywords(&mut defs, keywords);
                         true
                     }
                 }
@@ -769,11 +773,20 @@ pub(crate) fn lower_effect_chain_ir(ir: &EffectChainIr) -> AbilityDefinition {
     // Party (a Saga is not Equipment), wrong for Quest for the Holy Relic and
     // Stonehewer Giant (the searcher is not the moved Equipment).
     //
+    // CR 608.2c: The same flag also wires sub-chains whose own clauses
+    // anchor on the just-moved card via the bare-"it" anaphor
+    // (`TargetFilter::SelfRef`) — Emperor of Bones' "[…] put a creature
+    // card exiled with this creature onto the battlefield […]. It gains
+    // haste. Sacrifice it at the beginning of the next end step." The
+    // trailing GenericEffect/Pump and CreateDelayedTrigger subs target
+    // `SelfRef` so the runtime's `source_id` rewrite resolves them to the
+    // moved card instead of Emperor itself.
+    //
     // The `forward_result` flag makes the runtime forward the just-moved
     // card's id as the sub-ability's `source_id` (see `effects/mod.rs`
     // forward_result branch), so `Attach::resolve` operates on the correct
     // attaching object.
-    rewire_attach_forward_result(&mut result);
+    rewire_result_anchored_subchain(&mut result);
     wire_optional_cast_decline_fallback(&mut result);
     if matches!(&*result.effect, Effect::SearchOutsideGame { .. }) {
         result.optional = false;
@@ -835,17 +848,31 @@ fn target_choice_timing_for_clause(clause_ir: &ClauseIr) -> TargetChoiceTiming {
     }
 }
 
-/// CR 303.4f / CR 301.5b / CR 603.7d: Walk the chain and set
-/// `forward_result: true` on every `Dig`/`ChangeZone` whose `destination`
-/// is `Battlefield` and whose chained sub-ability is an `Attach` carrying
-/// the `ZoneChangedThisWay` condition. The condition is the parser-side
-/// signal that the Oracle text said "If a[n] [type] is/was put onto the
-/// battlefield this way, [attach it]" — i.e. the just-moved card must
-/// become the attaching object.
+/// CR 303.4f: Aura entering by non-spell means — controller chooses the enchanted object.
+/// CR 301.5b: Equipment entering attached via "put onto the battlefield attached to" wiring.
+/// CR 603.7d: A delayed trigger's source/controller is the parent ability's at creation time.
+/// CR 608.2c: Bare "it" anaphor in a later clause binds to the typed referent of an earlier clause.
+///
+/// Walk the chain and set `forward_result: true` on every `Dig`/`ChangeZone`
+/// whose `destination` is `Battlefield` and whose chained sub-ability anchors
+/// on the just-moved card. Two anchor shapes are recognized:
+///
+/// 1. `Attach` sub with a `ZoneChangedThisWay` condition — the Oracle text
+///    said "If a[n] [type] is/was put onto the battlefield this way,
+///    [attach it]" (Armored Skyhunter, Stonehewer Giant). The just-moved
+///    card becomes the attaching object.
+/// 2. A non-Attach sub whose own target slot (or a nested
+///    GenericEffect/CreateDelayedTrigger inside it) is `SelfRef` — the
+///    Oracle text used a bare-"it" anaphor for the just-moved card
+///    (Emperor of Bones: "put a creature card exiled with this creature
+///    onto the battlefield […]. It gains haste. Sacrifice it at the
+///    beginning of the next end step."). The runtime forward_result branch
+///    rewrites `sub.source_id` to the moved object, so `SelfRef` in the
+///    sub naturally resolves to it.
 ///
 /// Recurses through nested sub-abilities so chains of arbitrary depth
 /// (e.g. Skyhunter's Dig → Attach → PutAtLibraryPosition) are covered.
-fn rewire_attach_forward_result(def: &mut AbilityDefinition) {
+fn rewire_result_anchored_subchain(def: &mut AbilityDefinition) {
     if let Some(sub) = def.sub_ability.as_ref() {
         let sub_is_attach_with_zone_changed_cond = matches!(*sub.effect, Effect::Attach { .. })
             && matches!(
@@ -862,16 +889,77 @@ fn rewire_attach_forward_result(def: &mut AbilityDefinition) {
                 ..
             }
         );
-        if sub_is_attach_with_zone_changed_cond && parent_moves_to_battlefield {
+        if parent_moves_to_battlefield
+            && (sub_is_attach_with_zone_changed_cond || sub_targets_moved_card(sub))
+        {
             def.forward_result = true;
         }
     }
     if let Some(sub) = def.sub_ability.as_mut() {
-        rewire_attach_forward_result(sub);
+        rewire_result_anchored_subchain(sub);
     }
     if let Some(else_branch) = def.else_ability.as_mut() {
-        rewire_attach_forward_result(else_branch);
+        rewire_result_anchored_subchain(else_branch);
     }
+}
+
+/// CR 608.2c: True when a sub-ability anchors on the just-moved card via
+/// the bare-"it" anaphor. Two encodings are recognized:
+///
+/// - `TargetFilter::SelfRef` — encoded when the anaphor's antecedent is
+///   the source itself; the runtime `forward_result` branch rewrites
+///   `sub.source_id` to the moved object before resolution, so `SelfRef`
+///   resolves to it.
+/// - `TargetFilter::ParentTarget` — encoded when the upstream chunk-loop
+///   anaphor rewrite (`chain_has_prior_typed_referent` →
+///   `replace_target_with_parent`) already redirected the "it" to the
+///   parent's chosen-object slot. The parent for this pattern is a
+///   `ChangeZone` whose typed target is a compound filter
+///   (`And[Typed(<type>), ExiledBySource]`) — a description, not a
+///   targeting "target" keyword — so `ability.targets` is empty at
+///   resolution time. The runtime `forward_result` branch inserts the
+///   moved object into the sub's targets so `ParentTarget` resolves to
+///   it.
+///
+/// Walks the sub's leaf target slot, `GenericEffect`'s grant list
+/// (each `StaticDefinition.affected`), `CreateDelayedTrigger`'s inner
+/// `AbilityDefinition`, and nested `sub_ability` / `else_ability`.
+fn sub_targets_moved_card(sub: &AbilityDefinition) -> bool {
+    if matches!(
+        sub.effect.target_filter(),
+        Some(TargetFilter::SelfRef | TargetFilter::ParentTarget)
+    ) {
+        return true;
+    }
+    if let Effect::GenericEffect {
+        static_abilities, ..
+    } = &*sub.effect
+    {
+        if static_abilities.iter().any(|s| {
+            matches!(
+                s.affected.as_ref(),
+                Some(TargetFilter::SelfRef | TargetFilter::ParentTarget)
+            )
+        }) {
+            return true;
+        }
+    }
+    if let Effect::CreateDelayedTrigger { effect, .. } = &*sub.effect {
+        if sub_targets_moved_card(effect) {
+            return true;
+        }
+    }
+    if let Some(nested) = sub.sub_ability.as_ref() {
+        if sub_targets_moved_card(nested) {
+            return true;
+        }
+    }
+    if let Some(else_branch) = sub.else_ability.as_ref() {
+        if sub_targets_moved_card(else_branch) {
+            return true;
+        }
+    }
+    false
 }
 
 /// CR 702.33d + CR 608.2e: Resolve "create [N] of those tokens [instead]"
@@ -1582,6 +1670,28 @@ pub(super) fn strip_each_player_subject(text: &str) -> (Option<PlayerFilter>, St
         return (Some(controls_scope), deconjugated);
     }
 
+    // CR 508.6 + CR 104.3e: A "[source] attacked this turn" relative clause after
+    // "each player" / "each opponent" restricts the affected set to the players
+    // the ability source creature attacked this turn — Angel of Destiny: "each
+    // player this creature attacked this turn loses the game". Resolved as the
+    // source-specific `OpponentAttackedBySourceThisTurn`, which excludes the
+    // controller and avoids widening to players attacked by other creatures.
+    // Like the "who controls" clause above, the relative clause MUST be consumed
+    // and reflected in the scope; dropping it would over-apply the loss to every
+    // player (the bug behind issue #1599). General over the predicate verb —
+    // "loses the game", "loses N life", etc. all compose.
+    let rest_attacked_lower = rest.to_lowercase();
+    if let Some(((), after_clause)) = nom_on_lower(rest, &rest_attacked_lower, |i| {
+        let (i, _) = alt((tag("this creature "), tag("~ "), tag("it "))).parse(i)?;
+        value((), tag("attacked this turn ")).parse(i)
+    }) {
+        let deconjugated = subject::deconjugate_verb(after_clause);
+        return (
+            Some(PlayerFilter::OpponentAttackedBySourceThisTurn),
+            deconjugated,
+        );
+    }
+
     // Guard: static restriction predicates ("can't", "cannot", "don't", "may only",
     // "may not") belong to the static parser, not the imperative effect pipeline.
     // Intercepting them here would produce Unimplemented instead of typed static modes.
@@ -2093,8 +2203,10 @@ pub(super) fn strip_leading_duration(text: &str) -> Option<(Duration, &str)> {
     if let Some((duration, rest)) = nom_on_lower(text, &lower, |i| {
         alt((
             value(Duration::UntilEndOfTurn, tag("until end of turn, ")),
+            // CR 514.2: "until the end of your next turn" persists through
+            // that turn's cleanup step.
             value(
-                Duration::UntilNextTurnOf {
+                Duration::UntilEndOfNextTurnOf {
                     player: PlayerScope::Controller,
                 },
                 tag("until the end of your next turn, "),
@@ -2146,21 +2258,22 @@ pub(crate) fn strip_trailing_duration(text: &str) -> (&str, Option<Duration>) {
         (" this turn", Duration::UntilEndOfTurn),
         (" until end of turn", Duration::UntilEndOfTurn),
         (
+            // CR 514.2: cleanup-pruned next-turn duration.
             " until the end of your next turn",
-            Duration::UntilNextTurnOf {
+            Duration::UntilEndOfNextTurnOf {
                 player: PlayerScope::Controller,
             },
         ),
         (" until end of combat", Duration::UntilEndOfCombat),
-        // CR 611.2a + CR 108.3: Third-person "their next turn" appears in grants
-        // whose grantee is not the ability's controller (Suspend Aggression:
-        // "its owner may play it"; Expedited Inheritance: "its controller may
-        // ... They may play those cards"). Theme D's `granted_to` binds to the
-        // grantee, so `UntilNextTurnOf { Controller }` is semantically "until
-        // the end of the grantee's next turn" at prune time.
+        // CR 514.2 + CR 611.2a + CR 108.3: Third-person "their next turn"
+        // appears in grants whose grantee is not the ability's controller
+        // (Suspend Aggression: "its owner may play it"; Expedited Inheritance:
+        // "its controller may ... They may play those cards"). Theme D's
+        // `granted_to` binds to the grantee, so `UntilNextTurnOf { Controller }`
+        // is semantically "until the end of the grantee's next turn" at prune time.
         (
             " until the end of their next turn",
-            Duration::UntilNextTurnOf {
+            Duration::UntilEndOfNextTurnOf {
                 player: PlayerScope::Controller,
             },
         ),

@@ -404,10 +404,10 @@ pub fn candidate_actions_exact(state: &GameState) -> Vec<CandidateAction> {
             ..
         } => legal_targets
             .iter()
-            .map(|&target_id| {
+            .map(|target| {
                 candidate(
                     GameAction::ChooseTarget {
-                        target: Some(TargetRef::Object(target_id)),
+                        target: Some(target.clone()),
                     },
                     TacticalClass::Selection,
                     Some(*player),
@@ -533,6 +533,21 @@ pub fn candidate_actions_exact(state: &GameState) -> Vec<CandidateAction> {
                 Some(*player),
             ),
         ],
+        // CR 701.30b: One candidate per choosable opponent.
+        WaitingFor::ClashChooseOpponent {
+            player, candidates, ..
+        } => candidates
+            .iter()
+            .map(|opponent| {
+                candidate(
+                    GameAction::ChooseClashOpponent {
+                        opponent: *opponent,
+                    },
+                    TacticalClass::Selection,
+                    Some(*player),
+                )
+            })
+            .collect(),
         WaitingFor::BetweenGamesChoosePlayDraw { player, .. } => vec![
             candidate(
                 GameAction::ChoosePlayDraw { play_first: true },
@@ -782,6 +797,31 @@ pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
             }
         }
         WaitingFor::ScryChoice { player, cards } => select_cards_variants(*player, cards, None),
+        WaitingFor::CoinFlipKeepChoice {
+            player,
+            results,
+            keep_count,
+        } => {
+            // CR 705.1 + CR 614.1a: Krark's Thumb keep choice. `keep_count` is
+            // always 1 for the only consumer today, so each candidate keeps a
+            // single index. (Generalization: enumerate C(results.len(),
+            // keep_count) combos if a multi-keep effect is ever added.)
+            if *keep_count == 1 {
+                (0..results.len())
+                    .map(|index| {
+                        candidate(
+                            GameAction::SelectCoinFlips {
+                                keep_indices: vec![index],
+                            },
+                            TacticalClass::Selection,
+                            Some(*player),
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        }
         WaitingFor::DigChoice {
             player,
             keep_count,
@@ -2106,6 +2146,7 @@ pub fn candidate_actions_broad(state: &GameState) -> Vec<CandidateAction> {
         | WaitingFor::RepeatDecision { .. }
         | WaitingFor::LearnChoice { .. }
         | WaitingFor::TopOrBottomChoice { .. }
+        | WaitingFor::ClashChooseOpponent { .. }
         | WaitingFor::ClashCardPlacement { .. }
         | WaitingFor::BetweenGamesChoosePlayDraw { .. }
         | WaitingFor::OrderTriggers { .. }

@@ -29,9 +29,32 @@
     "fromSource": "(from {{source}})",
     "basePT": "(base {{power}}/{{toughness}})",
     "damage": "Damage: {{amount}}",
+    "activateCost": "Activate — {{cost}}",
     "ptDeltaFrom": "{{delta}} from {{source}}",
     "colors": "Colors: {{colors}}",
-    "colorless": "Colorless"
+    "colorless": "Colorless",
+    "chosen": {
+      "title": "Chosen",
+      "entry": "{{kind}}: {{value}}",
+      "playerValue": "Player {{id}}",
+      "twoColorsValue": "{{first}}, {{second}}",
+      "unknown": "Unknown",
+      "kind": {
+        "color": "Color",
+        "creatureType": "Creature type",
+        "basicLandType": "Basic land type",
+        "cardType": "Card type",
+        "oddOrEven": "Odd or even",
+        "cardName": "Card name",
+        "number": "Number",
+        "player": "Player",
+        "twoColors": "Two colors",
+        "tributeOutcome": "Tribute",
+        "keyword": "Keyword",
+        "label": "Label",
+        "fallback": "Choice"
+      }
+    }
   },
   "actionButton": {
     "clearAttackers": "Clear Attackers",
@@ -1121,6 +1144,10 @@
     "cleaveNormalLabel": "Cast Normally",
     "cleaveAltLabel": "Cast with Cleave",
     "cleaveSubtitle": "Cast {{name}} normally, or pay its Cleave cost to remove the bracketed text.",
+    "mtmteEyebrow": "More Than Meets the Eye",
+    "mtmteNormalLabel": "Cast Normally",
+    "mtmteAltLabel": "Cast Converted",
+    "mtmteSubtitle": "Cast {{name}} normally, or pay its More Than Meets the Eye cost to cast it converted (transformed, back face up).",
     "additionalExile": "+ Exile a card",
     "additionalSacrifice": "+ Sacrifice a permanent",
     "additionalPayLife": "+ Pay life",
@@ -1132,6 +1159,10 @@
     "title": "Choose a Protector",
     "battleFallback": "Battle",
     "subtitle": "{{name}} needs a new protector. Choose which opponent will defend it."
+  },
+  "clashOpponent": {
+    "title": "Choose Clash Opponent",
+    "subtitle": "Choose which opponent will clash with you."
   },
   "cardDataMissing": {
     "title": "Card Data Missing",
@@ -1423,5 +1454,16 @@
   "counterMoveDistribution": {
     "title": "Move {{counter}} counters",
     "subtitle": "{{source}} has {{count}} available. Remaining: {{remaining}}"
+  },
+  "coinFlip": {
+    "keep": {
+      "title": "Krark's Thumb",
+      "subtitle": "Flip two coins and ignore one — choose which result to keep.",
+      "heads": "Heads",
+      "tails": "Tails"
+    },
+    "buttons": {
+      "keep": "Keep this"
+    }
   }
 }

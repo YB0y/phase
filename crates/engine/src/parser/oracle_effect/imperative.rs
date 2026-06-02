@@ -25,10 +25,9 @@ use crate::parser::oracle_static::{
 use crate::types::ability::{
     AbilityCost, AbilityDefinition, AbilityKind, BounceSelection, CategoryChooserScope, ChoiceType,
     Chooser, ContinuousModification, ControllerRef, CopyRetargetPermission, Duration, Effect,
-    FilterProp, GainLifePlayer, LibraryPosition, MultiTargetSpec, OutsideGameSourcePool,
-    PaymentCost, PlayerScope, PreventionAmount, PreventionScope, PtStat, PtValue, QuantityExpr,
-    QuantityRef, SearchSelectionConstraint, StaticDefinition, TargetFilter, TypeFilter,
-    TypedFilter, ZoneOwner,
+    FilterProp, LibraryPosition, MultiTargetSpec, OutsideGameSourcePool, PaymentCost, PlayerScope,
+    PreventionAmount, PreventionScope, PtStat, PtValue, QuantityExpr, QuantityRef,
+    SearchSelectionConstraint, StaticDefinition, TargetFilter, TypeFilter, TypedFilter, ZoneOwner,
 };
 use crate::types::card_type::CoreType;
 use crate::types::phase::Phase;
@@ -654,7 +653,7 @@ pub(super) fn lower_numeric_imperative_ast(ast: NumericImperativeAst) -> Effect 
         },
         NumericImperativeAst::GainLife { amount } => Effect::GainLife {
             amount,
-            player: GainLifePlayer::Controller,
+            player: TargetFilter::Controller,
         },
         NumericImperativeAst::LoseLife { amount } => Effect::LoseLife {
             amount,
@@ -1297,6 +1296,7 @@ pub(super) fn parse_targeted_action_ast(
                         target,
                         origin,
                         destination: Zone::Battlefield,
+                        enters_under: d.enters_under,
                         enter_tapped: d.enter_tapped,
                     })
                 } else {
@@ -1323,6 +1323,7 @@ pub(super) fn parse_targeted_action_ast(
                         target,
                         origin,
                         destination: Zone::Hand,
+                        enters_under: None,
                         enter_tapped: false,
                     })
                 } else {
@@ -1335,6 +1336,7 @@ pub(super) fn parse_targeted_action_ast(
                         target,
                         origin,
                         destination: d.zone,
+                        enters_under: None,
                         enter_tapped: false,
                     })
                 } else {
@@ -1531,6 +1533,7 @@ pub(super) fn lower_targeted_action_ast(ast: TargetedImperativeAst) -> Effect {
             target,
             origin,
             destination,
+            enters_under,
             enter_tapped,
         } => {
             let origin = if matches!(target, TargetFilter::ExiledBySource) {
@@ -1542,6 +1545,7 @@ pub(super) fn lower_targeted_action_ast(ast: TargetedImperativeAst) -> Effect {
                 origin,
                 destination,
                 target,
+                enters_under,
                 enter_tapped,
             }
         }
@@ -1577,6 +1581,7 @@ pub(super) fn lower_targeted_action_ast(ast: TargetedImperativeAst) -> Effect {
                 // CR 611.2a: bound to the ability controller by
                 // `grant_permission::resolve`.
                 granted_to: None,
+                resolution_cleanup: None,
             },
             target,
             grantee: Default::default(),
@@ -2023,6 +2028,7 @@ pub(super) fn lower_search_and_creation_ast(ast: SearchCreationImperativeAst) ->
                 },
                 crate::types::ability::FilterProp::SameNameAsParentTarget,
             ])),
+            enters_under: None,
             enter_tapped: false,
         },
     }
@@ -3476,6 +3482,7 @@ pub(super) fn lower_put_ast(ast: PutImperativeAst) -> Effect {
                     origin: Some(Zone::Exile),
                     destination,
                     target,
+                    enters_under: None,
                     enter_tapped,
                 }
             } else {
@@ -4193,6 +4200,7 @@ fn change_zone_all_to_library_effect(origin: Zone) -> Effect {
         origin: Some(origin),
         destination: Zone::Library,
         target: TargetFilter::Controller,
+        enters_under: None,
         enter_tapped: false,
     }
 }
@@ -4970,6 +4978,47 @@ pub(super) fn lower_cost_resource_ast(ast: CostResourceImperativeAst) -> Effect 
     }
 }
 
+/// CR 500.8 + CR 510.2: Quantity for "<N> additional <step/phase>s". The
+/// scanner advances along word boundaries and tries a single composed
+/// combinator at each position:
+///   `quantifier ~ " additional"` where `quantifier` =
+///     `tag("that many")` → event-bound (`QuantityRef::EventContextAmount`)
+///   | `parse_number`        → literal N (e.g. "two additional combat phases")
+///
+/// Anything else — including the article forms "an"/"a"/"the" already parsed
+/// elsewhere as 1 — falls through to the singular default
+/// `QuantityExpr::Fixed { value: 1 }`. Anchoring on `" additional"` keeps the
+/// helper agnostic to surrounding sentence shapes ("you get that many
+/// additional upkeep steps after this phase", "after this phase, there is an
+/// additional combat phase").
+fn parse_additional_phase_count(lower: &str) -> QuantityExpr {
+    fn count_combinator(input: &str) -> OracleResult<'_, QuantityExpr> {
+        let event_bound = value(
+            QuantityExpr::Ref {
+                qty: QuantityRef::EventContextAmount,
+            },
+            tag("that many"),
+        );
+        let literal = map(nom_primitives::parse_number, |n| QuantityExpr::Fixed {
+            value: n as i32,
+        });
+        terminated(alt((event_bound, literal)), tag(" additional")).parse(input)
+    }
+
+    let mut remaining = lower;
+    while !remaining.is_empty() {
+        if let Ok((_rest, qty)) = count_combinator(remaining) {
+            return qty;
+        }
+        // Advance to the next word boundary so the combinator stays anchored
+        // to candidate quantifier positions.
+        remaining = remaining
+            .find(' ')
+            .map_or("", |i| remaining[i + 1..].trim_start());
+    }
+    QuantityExpr::Fixed { value: 1 }
+}
+
 pub(super) fn parse_imperative_family_ast(
     text: &str,
     lower: &str,
@@ -4992,6 +5041,7 @@ pub(super) fn parse_imperative_family_ast(
             } else {
                 vec![]
             },
+            count: parse_additional_phase_count(lower),
         }));
     }
     if nom_primitives::scan_contains(lower, "additional upkeep step") {
@@ -5000,6 +5050,7 @@ pub(super) fn parse_imperative_family_ast(
             phase: Phase::Upkeep,
             after: Phase::Upkeep,
             followed_by: vec![],
+            count: parse_additional_phase_count(lower),
         }));
     }
 
@@ -6441,6 +6492,87 @@ pub(super) fn counter_placement_is_mass(clause_lower: &str) -> bool {
         || nom_primitives::scan_contains(clause_lower, "on all ")
 }
 
+/// CR 122.1 + CR 608.2c: In a distributive "put a number of +1/+1 counters on
+/// EACH ... equal to THAT CREATURE's <stat>" (Canopy Gargantuan), "that
+/// creature" is the per-iteration recipient — each object receives counters
+/// equal to its OWN stat. The shared `parse_event_context_refs` lowers "that
+/// creature's <stat>" to `ObjectScope::CostPaidObject` (correct in trigger
+/// bodies, where it refers to the triggering object), so for a mass placement
+/// we rebind it to `ObjectScope::Recipient`; `resolve_add_all` then re-evaluates
+/// the count per object. A genuine cost referent ("the SACRIFICED creature's
+/// power") carries a cost/zone-change participle and is left as
+/// `CostPaidObject` — `resolve_add_all` resolves that once and applies it
+/// uniformly per CR 608.2k.
+fn rebind_distributive_recipient_count(count: QuantityExpr, lower: &str) -> QuantityExpr {
+    let is_cost_referent = nom_primitives::scan_contains(lower, "sacrificed")
+        || nom_primitives::scan_contains(lower, "exiled")
+        || nom_primitives::scan_contains(lower, "discarded")
+        || nom_primitives::scan_contains(lower, "milled");
+    if is_cost_referent {
+        return count;
+    }
+    rebind_costpaid_scope_to_recipient(count)
+}
+
+/// Walk a `QuantityExpr` and rebind `ObjectScope::CostPaidObject` on the object
+/// P/T/mana-value leaves to `ObjectScope::Recipient`. Recurses through the
+/// arithmetic wrappers ("that creature's toughness plus 1", "twice that
+/// creature's power") so the whole class composes.
+fn rebind_costpaid_scope_to_recipient(expr: QuantityExpr) -> QuantityExpr {
+    use crate::types::ability::ObjectScope::{CostPaidObject, Recipient};
+    match expr {
+        QuantityExpr::Ref { qty } => QuantityExpr::Ref {
+            qty: match qty {
+                QuantityRef::Power {
+                    scope: CostPaidObject,
+                } => QuantityRef::Power { scope: Recipient },
+                QuantityRef::Toughness {
+                    scope: CostPaidObject,
+                } => QuantityRef::Toughness { scope: Recipient },
+                QuantityRef::ObjectManaValue {
+                    scope: CostPaidObject,
+                } => QuantityRef::ObjectManaValue { scope: Recipient },
+                other => other,
+            },
+        },
+        QuantityExpr::Offset { inner, offset } => QuantityExpr::Offset {
+            inner: Box::new(rebind_costpaid_scope_to_recipient(*inner)),
+            offset,
+        },
+        QuantityExpr::Multiply { factor, inner } => QuantityExpr::Multiply {
+            factor,
+            inner: Box::new(rebind_costpaid_scope_to_recipient(*inner)),
+        },
+        QuantityExpr::DivideRounded {
+            inner,
+            divisor,
+            rounding,
+        } => QuantityExpr::DivideRounded {
+            inner: Box::new(rebind_costpaid_scope_to_recipient(*inner)),
+            divisor,
+            rounding,
+        },
+        QuantityExpr::Sum { exprs } => QuantityExpr::Sum {
+            exprs: exprs
+                .into_iter()
+                .map(rebind_costpaid_scope_to_recipient)
+                .collect(),
+        },
+        QuantityExpr::UpTo { max } => QuantityExpr::UpTo {
+            max: Box::new(rebind_costpaid_scope_to_recipient(*max)),
+        },
+        QuantityExpr::Power { base, exponent } => QuantityExpr::Power {
+            base,
+            exponent: Box::new(rebind_costpaid_scope_to_recipient(*exponent)),
+        },
+        QuantityExpr::Difference { left, right } => QuantityExpr::Difference {
+            left: Box::new(rebind_costpaid_scope_to_recipient(*left)),
+            right: Box::new(rebind_costpaid_scope_to_recipient(*right)),
+        },
+        QuantityExpr::Fixed { value } => QuantityExpr::Fixed { value },
+    }
+}
+
 pub(super) fn parse_zone_counter_ast(
     text: &str,
     lower: &str,
@@ -6516,7 +6648,7 @@ pub(super) fn parse_zone_counter_ast(
                 if is_all && multi_target.is_none() {
                     Some(ZoneCounterImperativeAst::PutCounterAll {
                         counter_type,
-                        count,
+                        count: rebind_distributive_recipient_count(count, lower),
                         target,
                     })
                 } else {
@@ -6601,6 +6733,7 @@ pub(super) fn lower_zone_counter_ast(ast: ZoneCounterImperativeAst) -> Effect {
                     origin,
                     destination: Zone::Exile,
                     target,
+                    enters_under: None,
                     enter_tapped: false,
                 }
             } else {
@@ -6806,27 +6939,23 @@ fn try_parse_attack_if_able(lower: &str) -> Option<ImperativeFamilyAst> {
     let trimmed = lower.trim_end_matches('.');
 
     // First try: bare forms without a player reference.
-    let result: Result<(&str, Duration), nom::Err<OracleError<'_>>> = alt((
-        value(Duration::UntilEndOfTurn, tag("attacks this turn if able")),
-        value(Duration::UntilEndOfTurn, tag("attack this turn if able")),
-        value(
-            Duration::UntilEndOfCombat,
-            tag("attacks this combat if able"),
+    // verb axis × phase axis (PATTERNS.md §8b): factor "attack(s)" out front,
+    // then map the phase clause to its duration.
+    let result: Result<(&str, Duration), nom::Err<OracleError<'_>>> = (
+        alt((tag("attacks"), tag("attack"))),
+        preceded(
+            tag(" "),
+            alt((
+                value(Duration::UntilEndOfTurn, tag("this turn if able")),
+                value(
+                    Duration::UntilEndOfCombat,
+                    alt((tag("this combat if able"), tag("that combat if able"))),
+                ),
+            )),
         ),
-        value(
-            Duration::UntilEndOfCombat,
-            tag("attack this combat if able"),
-        ),
-        value(
-            Duration::UntilEndOfCombat,
-            tag("attacks that combat if able"),
-        ),
-        value(
-            Duration::UntilEndOfCombat,
-            tag("attack that combat if able"),
-        ),
-    ))
-    .parse(trimmed);
+    )
+        .map(|(_, duration)| duration)
+        .parse(trimmed);
 
     if let Ok((_, duration)) = result {
         return Some(ImperativeFamilyAst::GainKeyword(Effect::GenericEffect {
@@ -8138,6 +8267,7 @@ mod tests {
                 origin,
                 destination,
                 target: TargetFilter::Or { filters },
+                enters_under: None,
                 enter_tapped,
             } => {
                 assert_eq!(origin, None);
@@ -8853,6 +8983,71 @@ mod tests {
         let lower = text.to_lowercase();
         let result = parse_imperative_family_ast(text, &lower, &mut ParseContext::default());
         assert!(result.is_some(), "Should parse 'after this phase' variant");
+    }
+
+    /// CR 500.8 + CR 510.2: Obeka, Splitter of Seconds — "you get that many
+    /// additional upkeep steps after this phase" must thread the triggering
+    /// combat damage amount through `EventContextAmount`, not collapse it to
+    /// the singular default.
+    #[test]
+    fn parse_obeka_that_many_additional_upkeep_steps_binds_event_amount() {
+        let text = "you get that many additional upkeep steps after this phase";
+        let lower = text.to_lowercase();
+        let result = parse_imperative_family_ast(text, &lower, &mut ParseContext::default());
+        let effect = lower_imperative_family_effect(
+            result.expect("Obeka consequent should parse as AdditionalPhase"),
+        );
+        match effect {
+            Effect::AdditionalPhase {
+                phase: Phase::Upkeep,
+                after: Phase::Upkeep,
+                count:
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::EventContextAmount,
+                    },
+                ..
+            } => {}
+            other => {
+                panic!("expected AdditionalPhase with EventContextAmount count, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn parse_fixed_count_additional_upkeep_steps_binds_literal_count() {
+        let text = "you get two additional upkeep steps after this phase";
+        let lower = text.to_lowercase();
+        let effect = lower_imperative_family_effect(
+            parse_imperative_family_ast(text, &lower, &mut ParseContext::default())
+                .expect("fixed-count additional upkeep should parse"),
+        );
+        match effect {
+            Effect::AdditionalPhase {
+                count: QuantityExpr::Fixed { value: 2 },
+                ..
+            } => {}
+            other => panic!("expected count=Fixed(2) for fixed-count form, got {other:?}"),
+        }
+    }
+
+    /// Singular "an additional upkeep step" must keep the legacy Fixed(1)
+    /// semantics so Paradox Haze and similar cards still push exactly one
+    /// extra step.
+    #[test]
+    fn parse_additional_upkeep_step_defaults_to_count_one() {
+        let text = "get an additional upkeep step after this step";
+        let lower = text.to_lowercase();
+        let effect = lower_imperative_family_effect(
+            parse_imperative_family_ast(text, &lower, &mut ParseContext::default())
+                .expect("should parse singular additional upkeep"),
+        );
+        match effect {
+            Effect::AdditionalPhase {
+                count: QuantityExpr::Fixed { value: 1 },
+                ..
+            } => {}
+            other => panic!("expected count=Fixed(1) for singular form, got {other:?}"),
+        }
     }
 
     #[test]
@@ -10203,6 +10398,128 @@ mod tests {
     }
 
     /// CR 706 + CR 706.2: "Roll a d20" with no modifier parses to a bare RollDie.
+    /// Issue #1675 — Canopy Gargantuan. "Put a number of +1/+1 counters on each
+    /// other creature you control equal to that creature's toughness." rebinds
+    /// the per-recipient "that creature's toughness" count to `Recipient` so the
+    /// resolver re-evaluates it per object.
+    #[test]
+    fn put_counter_all_each_equal_to_that_creatures_toughness_rebinds_to_recipient() {
+        use crate::types::ability::ObjectScope;
+        let def = super::super::parse_effect_chain(
+            "Put a number of +1/+1 counters on each other creature you control equal to that creature's toughness.",
+            AbilityKind::Spell,
+        );
+        match &*def.effect {
+            Effect::PutCounterAll { count, .. } => assert!(
+                matches!(
+                    count,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::Toughness {
+                            scope: ObjectScope::Recipient
+                        }
+                    }
+                ),
+                "count must rebind to Recipient, got {count:?}"
+            ),
+            other => panic!("expected PutCounterAll, got {other:?}"),
+        }
+    }
+
+    /// The rebind is gated: a genuine cost referent ("the sacrificed creature's
+    /// power") stays `CostPaidObject` (resolved once, applied uniformly), so the
+    /// rebind does not hijack cost-paid `*All` counts.
+    #[test]
+    fn rebind_distributive_recipient_count_leaves_cost_referent_alone() {
+        use crate::types::ability::ObjectScope;
+        let cost_paid = QuantityExpr::Ref {
+            qty: QuantityRef::Power {
+                scope: ObjectScope::CostPaidObject,
+            },
+        };
+        let out = super::rebind_distributive_recipient_count(
+            cost_paid.clone(),
+            "put a +1/+1 counter on each creature you control equal to the sacrificed creature's power",
+        );
+        assert_eq!(
+            out, cost_paid,
+            "cost-referent count must NOT rebind to Recipient"
+        );
+
+        // And "that creature's power" (no cost participle) DOES rebind.
+        let anaphor = QuantityExpr::Ref {
+            qty: QuantityRef::Power {
+                scope: ObjectScope::CostPaidObject,
+            },
+        };
+        let rebound = super::rebind_distributive_recipient_count(
+            anaphor,
+            "put a +1/+1 counter on each creature you control equal to that creature's power",
+        );
+        assert!(matches!(
+            rebound,
+            QuantityExpr::Ref {
+                qty: QuantityRef::Power {
+                    scope: ObjectScope::Recipient
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn rebind_distributive_recipient_count_walks_all_quantity_wrappers() {
+        use crate::types::ability::ObjectScope;
+
+        let expr = QuantityExpr::Difference {
+            left: Box::new(QuantityExpr::Ref {
+                qty: QuantityRef::Power {
+                    scope: ObjectScope::CostPaidObject,
+                },
+            }),
+            right: Box::new(QuantityExpr::Power {
+                base: 2,
+                exponent: Box::new(QuantityExpr::UpTo {
+                    max: Box::new(QuantityExpr::Ref {
+                        qty: QuantityRef::ObjectManaValue {
+                            scope: ObjectScope::CostPaidObject,
+                        },
+                    }),
+                }),
+            }),
+        };
+
+        let rebound = super::rebind_distributive_recipient_count(
+            expr,
+            "put a number of +1/+1 counters on each creature you control equal to that creature's power",
+        );
+
+        let QuantityExpr::Difference { left, right } = rebound else {
+            panic!("expected Difference, got {rebound:?}");
+        };
+        assert!(matches!(
+            *left,
+            QuantityExpr::Ref {
+                qty: QuantityRef::Power {
+                    scope: ObjectScope::Recipient
+                }
+            }
+        ));
+
+        let QuantityExpr::Power { exponent, .. } = *right else {
+            panic!("expected Power, got {right:?}");
+        };
+        let QuantityExpr::UpTo { max } = *exponent else {
+            panic!("expected UpTo, got {exponent:?}");
+        };
+        assert!(matches!(
+            *max,
+            QuantityExpr::Ref {
+                qty: QuantityRef::ObjectManaValue {
+                    scope: ObjectScope::Recipient
+                }
+            }
+        ));
+    }
+
     #[test]
     fn roll_a_d20_no_modifier_parses_to_roll_die() {
         let def = super::super::parse_effect_chain("Roll a d20.", AbilityKind::Spell);

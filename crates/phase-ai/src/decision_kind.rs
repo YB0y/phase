@@ -121,6 +121,7 @@ pub fn classify(waiting_for: &WaitingFor, action: &GameAction) -> DecisionKind {
         | WaitingFor::RepeatDecision { .. }
         | WaitingFor::TopOrBottomChoice { .. }
         | WaitingFor::PopulateChoice { .. }
+        | WaitingFor::ClashChooseOpponent { .. }
         | WaitingFor::ClashCardPlacement { .. }
         | WaitingFor::VoteChoice { .. }
         | WaitingFor::SeparatePilesPartition { .. }
@@ -142,6 +143,9 @@ pub fn classify(waiting_for: &WaitingFor, action: &GameAction) -> DecisionKind {
         | WaitingFor::MiracleReveal { .. }
         | WaitingFor::ChooseOneOfBranch { .. }
         | WaitingFor::PayManaAbilityMana { .. }
+        // CR 705.1 + CR 614.1a: Krark's Thumb keep choice is a forced
+        // mid-resolution selection; route to the ability catch-all.
+        | WaitingFor::CoinFlipKeepChoice { .. }
         | WaitingFor::ActivationCostOneOfChoice { .. } => DecisionKind::ActivateAbility,
     }
 }

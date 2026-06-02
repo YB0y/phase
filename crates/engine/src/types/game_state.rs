@@ -773,6 +773,34 @@ pub struct PendingRepeatIteration {
     pub total_iterations: usize,
 }
 
+/// CR 705.1 + CR 614.1a: Discriminates which multi-flip resolver paused for a
+/// Krark's Thumb keep-1 choice, carrying the loop position needed to re-enter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PendingCoinFlipKind {
+    /// `Effect::FlipCoin` — a single logical flip.
+    Single,
+    /// `Effect::FlipCoins { count }` — `remaining` flips still to perform after
+    /// the one currently paused for a keep choice.
+    FlipN { remaining: u32 },
+    /// `Effect::FlipCoinUntilLose` — `wins_so_far` flips won before the one
+    /// currently paused for a keep choice.
+    UntilLose { wins_so_far: u32 },
+}
+
+/// CR 705.1 + CR 614.1a: Full resolution context + loop position for a
+/// multi-flip resolver paused mid-loop for a Krark's Thumb keep-1 choice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingCoinFlip {
+    pub source_id: ObjectId,
+    pub controller: PlayerId,
+    pub targets: Vec<TargetRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub win_effect: Option<Box<AbilityDefinition>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lose_effect: Option<Box<AbilityDefinition>>,
+    pub kind: PendingCoinFlipKind,
+}
+
 /// CR 614.12b + CR 614.1c + CR 614.13: Resume state for a multi-target
 /// `ChangeZone` resolution loop paused when one of the moving objects
 /// triggered a per-permanent replacement choice (shock-land "pay 2 life?",
@@ -1617,6 +1645,8 @@ pub enum AlternativeCastKeyword {
     /// CR 702.148a-b + CR 612: Paying the cleave cost removes every
     /// square-bracketed span from the spell's text (a text-changing effect).
     Cleave,
+    /// CR 702.162a: Cast converted (back face up, CR 712.14a) for the MTMTE cost.
+    MoreThanMeetsTheEye,
 }
 
 /// CR 601.2b: Engine-authored cast-variant option for spells with more than
@@ -1704,6 +1734,12 @@ pub enum CastOfferKind {
     Discover {
         hit_card: ObjectId,
         exiled_misses: Vec<ObjectId>,
+        /// CR 701.57a: "Discover N" — the resulting spell's mana value must be
+        /// less than or equal to N for the cast to proceed. Carried on the
+        /// offer so the cast-during-resolution path can build the `ManaValue`
+        /// gate. `serde(default)` because this is live serialized pause-state.
+        #[serde(default)]
+        discover_value: u32,
     },
 }
 
@@ -1871,13 +1907,13 @@ pub enum WaitingFor {
         remaining: Vec<ObjectId>,
         pending_effect: Box<ResolvedAbility>,
     },
-    /// CR 303.4 + CR 303.4a + CR 303.4g + CR 614.12 + CR 115.1b: After a
-    /// return-as-Aura sub-effect resolves and finds 2+ legal objects matching
-    /// the parsed enchant filter, the controller picks which permanent the
-    /// returned object attaches to. This is a CHOICE (CR 303.4f / 303.4g), not
-    /// a target (CR 115.1b applies to Aura spells being cast — return-as-Aura
-    /// is a sub-effect of a different ability), so hexproof / shroud /
-    /// protection do NOT filter `legal_targets`.
+    /// CR 303.4 + CR 303.4a + CR 303.4f + CR 303.4g + CR 614.12 + CR 115.1b:
+    /// After a return-as-Aura sub-effect or a non-spell Aura battlefield entry
+    /// finds 2+ legal objects or players matching the parsed enchant filter,
+    /// the controller picks which host the Aura attaches to. This is a CHOICE
+    /// (CR 303.4f / CR 303.4g), not a target (CR 115.1b applies to Aura spells
+    /// being cast), so hexproof / shroud / protection do NOT filter
+    /// `legal_targets`.
     ///
     /// **Forward-looking note (per add-engine-variant gate):** if a fourth
     /// resolution-time-pick `WaitingFor` variant is added (e.g., a future
@@ -1889,18 +1925,18 @@ pub enum WaitingFor {
     ReturnAsAuraTarget {
         player: PlayerId,
         source_id: ObjectId,
-        /// The host object that was just returned to the battlefield by the
-        /// preceding `Effect::ChangeZone` and that this `Effect::ReturnAsAura`
-        /// is converting into an Aura.
+        /// The Aura object on the battlefield awaiting a controller-selected
+        /// enchant host.
         returned_id: ObjectId,
-        /// Battlefield objects (excluding `returned_id`) that satisfy the
-        /// parsed `enchant_filter`. Built via `filter::matches_target_filter`
-        /// — hexproof / shroud / protection are intentionally NOT applied
-        /// here (CR 303.4 / CR 115.1b distinction).
-        legal_targets: Vec<ObjectId>,
+        /// Battlefield objects (excluding `returned_id`) or players that
+        /// satisfy the parsed `enchant_filter`. Built via
+        /// `filter::matches_target_filter` / `player_matches_target_filter` —
+        /// hexproof / shroud / protection are intentionally NOT applied here
+        /// (CR 303.4 / CR 115.1b distinction).
+        legal_targets: Vec<TargetRef>,
         /// The `ResolvedAbility` that emitted this picker; cloned so
-        /// `finalize_attach` can re-read `effect.enchant_filter` and
-        /// `effect.grants` after the pick lands.
+        /// return-as-Aura can re-read `effect.enchant_filter` / `effect.grants`,
+        /// and generic Aura entry can preserve source metadata for completion.
         pending_effect: Box<ResolvedAbility>,
     },
     EquipTarget {
@@ -1939,6 +1975,14 @@ pub enum WaitingFor {
     ScryChoice {
         player: PlayerId,
         cards: Vec<ObjectId>,
+    },
+    /// CR 705.1 + CR 614.1a: Krark's Thumb — the controller flipped `results.len()`
+    /// coins for one logical flip and must ignore all but `keep_count`. `results[i]`
+    /// is true for heads/won (CR 705.2).
+    CoinFlipKeepChoice {
+        player: PlayerId,
+        results: Vec<bool>,
+        keep_count: usize,
     },
     /// CR 701.20e: Waiting for the player to choose which looked-at cards to keep.
     DigChoice {
@@ -2667,6 +2711,16 @@ pub enum WaitingFor {
         source_id: ObjectId,
         valid_tokens: Vec<ObjectId>,
     },
+    /// CR 701.30b: "Clash with an opponent" lets the clashing player choose
+    /// which opponent to clash with. Only entered when two or more opponents
+    /// are available (with one opponent there is no decision). `candidates`
+    /// is the set of legal opponents; `ability` is the resolving clash ability,
+    /// carried so the clash can be performed against the chosen opponent.
+    ClashChooseOpponent {
+        player: PlayerId,
+        candidates: Vec<PlayerId>,
+        ability: Box<crate::types::ability::ResolvedAbility>,
+    },
     /// CR 701.30c: After a clash, each player puts their revealed card on top or
     /// bottom of their library. Choices are made in APNAP order. `remaining` holds
     /// the next player/card pairs still awaiting a choice.
@@ -2888,7 +2942,7 @@ pub enum WaitingFor {
         current_slot: usize,
     },
     /// CR 510.1c: Attacker with multiple blockers — controller divides damage as they choose.
-    /// CR 702.19b/c: Trample requires lethal to each blocker before excess to defending player.
+    /// CR 702.19b/c: Trample requires lethal to each blocker before assigning excess.
     AssignCombatDamage {
         player: PlayerId,
         attacker_id: ObjectId,
@@ -3019,12 +3073,12 @@ pub enum CombatDamageAssignmentMode {
 }
 
 /// CR 510.1c: A blocker with its lethal damage threshold for UI display.
-/// `lethal_minimum` is only enforced as a hard constraint for trample (CR 702.19b).
+/// `lethal_minimum` is only enforced as a hard constraint before trample excess (CR 702.19b).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DamageSlot {
     pub blocker_id: ObjectId,
     /// Lethal damage threshold. CR 702.2c: With deathtouch, lethal = 1.
-    /// Informational for non-trample; enforced for trample (CR 702.19b).
+    /// Informational for non-trample; enforced before trample excess (CR 702.19b).
     pub lethal_minimum: u32,
 }
 
@@ -3116,6 +3170,7 @@ impl WaitingFor {
             | WaitingFor::StationTarget { player, .. }
             | WaitingFor::SaddleMount { player, .. }
             | WaitingFor::ScryChoice { player, .. }
+            | WaitingFor::CoinFlipKeepChoice { player, .. }
             | WaitingFor::DigChoice { player, .. }
             | WaitingFor::SurveilChoice { player, .. }
             | WaitingFor::RevealChoice { player, .. }
@@ -3164,6 +3219,7 @@ impl WaitingFor {
             | WaitingFor::RepeatDecision { player, .. }
             | WaitingFor::TopOrBottomChoice { player, .. }
             | WaitingFor::PopulateChoice { player, .. }
+            | WaitingFor::ClashChooseOpponent { player, .. }
             | WaitingFor::ClashCardPlacement { player, .. }
             | WaitingFor::CompanionReveal { player, .. }
             | WaitingFor::ChooseLegend { player, .. }
@@ -3633,6 +3689,13 @@ pub enum CastingVariant {
     /// spell — there is no on-resolve special behavior, so the spell goes to its
     /// owner's graveyard like any instant/sorcery.
     Cleave,
+    /// CR 702.162a + CR 712.14a: Cast from any castable zone via the More Than
+    /// Meets the Eye alternative cost. The printed mana cost is replaced by the
+    /// `Keyword::MoreThanMeetsTheEye(cost)` payload at cast preparation (mirrors
+    /// Overload). On resolution the spell is cast CONVERTED — the resulting
+    /// permanent enters the battlefield transformed (back face up) via the
+    /// existing `enter_transformed` ZoneChange seed. CR 701.28 (Convert).
+    MoreThanMeetsTheEye,
 }
 
 impl CastingVariant {
@@ -3663,6 +3726,16 @@ impl CastingVariant {
 
     pub fn replaces_stack_to_graveyard_with_exile(self) -> bool {
         matches!(self.stack_to_graveyard_replacement(), Some(Zone::Exile))
+    }
+
+    /// CR 400.7 + CR 712.11a: these variants put a non-front face on the
+    /// stack. If the spell leaves the stack without becoming that face on the
+    /// battlefield, restore the object's normal front-face characteristics.
+    pub fn restores_front_face_after_stack_exit(self) -> bool {
+        matches!(
+            self,
+            CastingVariant::Adventure | CastingVariant::Omen | CastingVariant::MoreThanMeetsTheEye
+        )
     }
 }
 
@@ -4468,6 +4541,12 @@ pub struct GameState {
     /// turn" (Militant Angel).
     #[serde(default)]
     pub attacked_defenders_this_turn: HashMap<PlayerId, HashSet<PlayerId>>,
+    /// CR 508.6 + CR 508.1b: For each creature declared as an attacker this
+    /// turn, the defending players it attacked. This is the source-specific
+    /// counterpart to `attacked_defenders_this_turn` for text like "each player
+    /// this creature attacked this turn" (Angel of Destiny).
+    #[serde(default)]
+    pub creature_attacked_defenders_this_turn: HashMap<ObjectId, HashSet<PlayerId>>,
     /// CR 500.8 + CR 506.1: Number of combat phases that have begun this turn.
     /// Used by intervening-if triggers that only fire during the first combat phase.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
@@ -4575,6 +4654,13 @@ pub struct GameState {
     /// [`PendingChangeZoneIteration`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_change_zone_iteration: Option<PendingChangeZoneIteration>,
+
+    /// CR 705.1 + CR 614.1a: Pending multi-flip coin resolver paused mid-loop
+    /// for a Krark's Thumb keep-1 choice. Stashes the full resolution context +
+    /// loop position so `resume_after_keep` can re-enter the flip loop after the
+    /// player's `CoinFlipKeepChoice`. See [`PendingCoinFlip`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_coin_flip: Option<PendingCoinFlip>,
 
     /// CR 608.2c + CR 107.1c: Pending "repeat this process" loop paused because
     /// an iteration's process entered an interactive `WaitingFor` state.
@@ -4715,6 +4801,19 @@ pub struct GameState {
     /// damage, counter removal). Read by QuantityRef::PreviousEffectAmount.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_effect_amount: Option<i32>,
+
+    /// CR 706.2: The actual result (natural + modifiers, clamped at 0) of the
+    /// most recent die roll within the current ability resolution. Set by
+    /// `roll_die::resolve` immediately after emitting `GameEvent::DieRolled`, read by
+    /// `QuantityRef::EventContextAmount` so an inline "equal to the result" sub_ability
+    /// (CR 706.4 — no results table) consumes the rolled value rather than the
+    /// numeric amount of the triggering event (e.g. combat damage). Resolution-scoped:
+    /// cleared at `apply()` entry and at every depth-0 chain entry, so it is `Some`
+    /// only between the roll and the sub_ability that reads it. Follows the
+    /// `last_effect_amount` PartialEq-OMISSION pattern: NOT compared in the
+    /// hand-written `PartialEq` (safe — always cleared at comparison boundaries).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub die_result_this_resolution: Option<u8>,
 
     /// Count from the most recent interactive effect resolution (e.g., number of cards
     /// actually discarded in a DiscardChoice). Used as fallback for EventContextAmount
@@ -5031,6 +5130,17 @@ impl GameState {
             .is_some_and(|defenders| defenders.contains(&defender))
     }
 
+    /// CR 508.6: True if `attacker` was declared attacking `defender` this turn.
+    pub fn creature_attacked_player_this_turn(
+        &self,
+        attacker: ObjectId,
+        defender: PlayerId,
+    ) -> bool {
+        self.creature_attacked_defenders_this_turn
+            .get(&attacker)
+            .is_some_and(|defenders| defenders.contains(&defender))
+    }
+
     /// Create a new game with the given format configuration and player count.
     pub fn new(config: FormatConfig, player_count: u8, seed: u64) -> Self {
         let players: Vec<Player> = (0..player_count)
@@ -5155,6 +5265,7 @@ impl GameState {
             players_attacked_this_turn: HashSet::new(),
             attacking_creatures_this_turn: HashMap::new(),
             attacked_defenders_this_turn: HashMap::new(),
+            creature_attacked_defenders_this_turn: HashMap::new(),
             combat_phases_started_this_turn: 0,
             creatures_attacked_this_turn: HashSet::new(),
             creatures_blocked_this_turn: HashSet::new(),
@@ -5179,6 +5290,7 @@ impl GameState {
             pending_continuation: None,
             pending_repeat_iteration: None,
             pending_change_zone_iteration: None,
+            pending_coin_flip: None,
             pending_repeat_until: None,
             pending_choose_one_of: None,
             pending_counter_moves: None,
@@ -5200,6 +5312,7 @@ impl GameState {
             last_vote_ballots: im::Vector::new(),
             player_actions_this_way: HashSet::new(),
             last_effect_amount: None,
+            die_result_this_resolution: None,
             last_effect_count: None,
             last_effect_counts_by_player: HashMap::new(),
             clause_minimum_snapshot: None,
@@ -5447,6 +5560,8 @@ impl PartialEq for GameState {
             && self.players_attacked_this_turn == other.players_attacked_this_turn
             && self.attacking_creatures_this_turn == other.attacking_creatures_this_turn
             && self.attacked_defenders_this_turn == other.attacked_defenders_this_turn
+            && self.creature_attacked_defenders_this_turn
+                == other.creature_attacked_defenders_this_turn
             && self.combat_phases_started_this_turn == other.combat_phases_started_this_turn
             && self.creatures_attacked_this_turn == other.creatures_attacked_this_turn
             && self.creatures_blocked_this_turn == other.creatures_blocked_this_turn
@@ -5472,6 +5587,7 @@ impl PartialEq for GameState {
             && self.pending_continuation == other.pending_continuation
             && self.pending_repeat_iteration == other.pending_repeat_iteration
             && self.pending_change_zone_iteration == other.pending_change_zone_iteration
+            && self.pending_coin_flip == other.pending_coin_flip
             && self.pending_repeat_until == other.pending_repeat_until
             && self.pending_choose_one_of == other.pending_choose_one_of
             && self.pending_counter_moves == other.pending_counter_moves
