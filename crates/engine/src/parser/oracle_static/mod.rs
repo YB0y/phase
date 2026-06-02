@@ -32,8 +32,8 @@ mod prelude {
         parse_cda_quantity, parse_event_context_quantity, parse_for_each_clause, parse_quantity_ref,
     };
     pub(super) use super::super::oracle_target::{
-        parse_combat_status_prefix, parse_counter_suffix, parse_mana_value_suffix, parse_target,
-        parse_that_clause_suffix, parse_type_phrase,
+        distribute_controller_to_or, parse_combat_status_prefix, parse_counter_suffix,
+        parse_mana_value_suffix, parse_target, parse_that_clause_suffix, parse_type_phrase,
     };
     pub(super) use super::super::oracle_util::{
         has_unconsumed_conditional, infer_core_type_for_subtype, parse_comparator_prefix,
@@ -97,7 +97,7 @@ mod support {
         parse_compound_subject_rule_static, parse_property_descriptor,
         parse_rule_static_separator_nom, try_parse_compound_subtypes,
         try_parse_scoped_must_attack_block, try_split_and_can_attack_despite_defender,
-        try_split_and_must_attack_block,
+        try_split_and_can_block_additional, try_split_and_must_attack_block,
     };
     pub(super) use super::grammar::*;
     pub(super) use super::keyword_grant::{

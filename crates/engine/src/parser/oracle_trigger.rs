@@ -1304,6 +1304,30 @@ fn extract_unless_pay_modifier(
         return (cleaned, Some(UnlessPayModifier { cost, payer }));
     }
 
+    // CR 118.12a: "[trigger] ... unless they/that player/that opponent
+    // {sacrifice|discard|pay life} [or ...]" — same disjunctive non-mana
+    // unless-cost shape the resolution-time path handles. Delegate to the
+    // single authority (`parse_unless_they_alt_cost_chain`) so trigger-side
+    // and resolution-side parse identically. The chain requires an explicit
+    // pronoun ("they"/"that player"/"that opponent"), so "you"/mana forms
+    // fall through to the existing blocks unchanged.
+    //
+    // GUARD: the chain's per-branch `unless_branch_boundary` stops at the
+    // first sentence terminator, so it would greedily strip the first
+    // unless-clause of a multi-sentence modal effect ("... unless they
+    // discard a card. If you're the monarch, instead ..." — Court of
+    // Ambition). A later "if"-sentence means the whole effect is not a single
+    // terminal unless-cost; defer to the gap path (mirrors the `unless`
+    // dispatch guard below at the `Unsupported unless clause` site).
+    if !has_later_sentence_if(&lower) {
+        if let Some(cost) = parse_unless_they_alt_cost_chain(after_unless) {
+            let payer = infer_pronoun_unless_payer(&lower[..unless_pos], condition_lower)
+                .unwrap_or(TargetFilter::TriggeringPlayer);
+            let cleaned = text[..unless_pos].trim().to_string();
+            return (cleaned, Some(UnlessPayModifier { cost, payer }));
+        }
+    }
+
     // CR 118.12 + CR 608.2c + CR 119.4: Non-mana alternative costs ("you discard
     // a card", "you sacrifice a [filter]", "you pay N life") map to existing
     // `UnlessCost` variants — the runtime resolver in `engine_payment_choices.rs`
@@ -1465,11 +1489,15 @@ fn infer_pronoun_unless_payer(
     if effect_references_that_player(effect_before_unless) {
         return Some(TargetFilter::TriggeringPlayer);
     }
-    // CR 608.2c: in "each opponent [does X] unless they pay", the lowered
-    // ability has `player_scope = Opponent`; runtime binds `Controller` to
-    // each scoped opponent before presenting the unless-payment choice.
+    // CR 608.2c + CR 608.2f: in "each opponent [does X] unless they pay", the
+    // lowered ability has `player_scope = Opponent`; the runtime fan-out binds
+    // `ability.scoped_player` to each scoped opponent per iteration. The payer
+    // must read that per-iteration binding via `ScopedPlayer` —
+    // `resolve_effect_player_ref` maps `ScopedPlayer -> ability.scoped_player`
+    // (targeting.rs). `Controller` would wrongly resolve to `state.active_player`
+    // (effects/mod.rs), which is not the scoped opponent on a non-active turn.
     if scan_contains(effect_before_unless, "each opponent ") {
-        return Some(TargetFilter::Controller);
+        return Some(TargetFilter::ScopedPlayer);
     }
     if scan_contains(effect_before_unless, "creature's controller ") {
         return Some(TargetFilter::ParentTargetController);
@@ -1810,16 +1838,12 @@ fn parse_unless_they_sacrifice_filter(input: &str) -> Option<(AbilityCost, &str)
     if matches!(filter, TargetFilter::Any) || !remainder.trim().is_empty() {
         return None;
     }
-    // CR 109.4 + CR 115.1 + CR 118.12a: "they sacrifice" pins the sacrificed
-    // permanent to the *payer* — the targeted player on the enclosing
-    // activated/triggered ability. `ControllerRef::TargetPlayer` reads the
-    // first `TargetRef::Player` from `ability.targets` at resolution time,
-    // which is exactly the payer the unless-cost surfaces to. Mirrors the
-    // "you sacrifice" branch's controller treatment in
-    // `parse_unless_sacrifice_filter` (which carries `ControllerRef::You`
-    // via the actor dispatch upstream); for the "they" form the actor *is*
-    // the target player and we stamp it explicitly here.
-    let filter = add_controller(filter, ControllerRef::TargetPlayer);
+    // CR 109.5 + CR 118.12a: "they sacrifice" pins the sacrificed permanent
+    // to the player paying the unless-cost. Cost payment evaluates filters with
+    // the payer as the source controller (`FilterContext::from_source_with_controller`),
+    // so `ControllerRef::You` is the payer-relative scope for target-player,
+    // triggering-player, and scoped-player punishers alike.
+    let filter = add_controller(filter, ControllerRef::You);
     Some((
         AbilityCost::Sacrifice {
             target: filter,
@@ -10370,7 +10394,7 @@ mod tests {
     use crate::types::ability::{
         AbilityCondition, AbilityCost, AbilityKind, AggregateFunction, BounceSelection,
         CastingPermission, Comparator, ContinuousModification, ControllerRef, CountScope,
-        DamageModification, DelayedTriggerCondition, Duration, Effect, FilterProp,
+        DamageModification, DamageSource, DelayedTriggerCondition, Duration, Effect, FilterProp,
         ManaSpendPermission, ObjectScope, PlayerFilter, PlayerScope, PtStat, PtValue, PtValueScope,
         QuantityExpr, QuantityRef, SharedQuality, TargetFilter, TypeFilter, TypedFilter,
     };
@@ -11599,6 +11623,85 @@ mod tests {
         }
     }
 
+    /// Issue #1499 — Arabella, Abandoned Doll: "Whenever Arabella attacks, it
+    /// deals X damage to each opponent and you gain X life, where X is the
+    /// number of creatures you control with power 2 or less." The attack trigger
+    /// must bind X to a dynamic creature count (a `QuantityRef::ObjectCount`),
+    /// not a `Variable("X")` placeholder that resolves to 0 at runtime.
+    #[test]
+    fn arabella_attack_trigger_binds_x_to_creature_count() {
+        let def = parse_trigger_line(
+            "Whenever Arabella, Abandoned Doll attacks, it deals X damage to each \
+             opponent and you gain X life, where X is the number of creatures you \
+             control with power 2 or less.",
+            "Arabella, Abandoned Doll",
+        );
+        assert_eq!(def.mode, TriggerMode::Attacks);
+        let execute = def
+            .execute
+            .as_ref()
+            .expect("Arabella attack trigger must have an execute");
+        match &*execute.effect {
+            Effect::DamageEachPlayer { amount, .. } => assert!(
+                matches!(
+                    amount,
+                    QuantityExpr::Ref {
+                        qty: crate::types::ability::QuantityRef::ObjectCount { .. }
+                    }
+                ),
+                "X must bind to a dynamic creature count, got {amount:?}"
+            ),
+            other => panic!("expected DamageEachPlayer top effect, got {other:?}"),
+        }
+    }
+
+    /// Issue #1585 — Pantlaza, Sun-Favored: "Whenever Pantlaza or another
+    /// Dinosaur you control enters, you may discover X, where X is that
+    /// creature's toughness. Do this only once each turn." The trigger must be
+    /// an ETB (`ChangesZone` -> Battlefield), constrained to once per turn, and
+    /// its execute must be a `Discover` whose limit binds to the *entering*
+    /// creature's toughness - NOT a `Variable("X")` placeholder, which resolves
+    /// to 0 at runtime and makes discover a silent no-op ("did not discover").
+    #[test]
+    fn trigger_pantlaza_etb_discover_x_is_entering_creature_toughness() {
+        let def = parse_trigger_line(
+            "Whenever Pantlaza or another Dinosaur you control enters, you may \
+             discover X, where X is that creature's toughness. Do this only \
+             once each turn. (Exile cards from the top of your library until \
+             you exile a nonland card with that mana value or less. Cast it \
+             without paying its mana cost or put it into your hand. Put the \
+             rest on the bottom in a random order.)",
+            "Pantlaza, Sun-Favored",
+        );
+        assert_eq!(def.mode, TriggerMode::ChangesZone);
+        assert_eq!(def.destination, Some(Zone::Battlefield));
+        assert_eq!(
+            def.constraint,
+            Some(crate::types::ability::TriggerConstraint::OncePerTurn),
+            "\"Do this only once each turn\" must map to OncePerTurn",
+        );
+
+        let execute = def
+            .execute
+            .as_ref()
+            .expect("trigger should have execute step");
+        match execute.effect.as_ref() {
+            Effect::Discover { mana_value_limit } => {
+                assert!(
+                    matches!(
+                        mana_value_limit,
+                        QuantityExpr::Ref {
+                            qty: crate::types::ability::QuantityRef::Toughness { .. }
+                        }
+                    ),
+                    "discover X must bind to the entering creature's toughness, \
+                     not a Variable placeholder (got {mana_value_limit:?})",
+                );
+            }
+            other => panic!("Expected Discover, got {other:?}"),
+        }
+    }
+
     #[test]
     fn trigger_battalion() {
         let def = parse_trigger_line(
@@ -12700,6 +12803,59 @@ mod tests {
             transform_sub.sub_link,
             SubAbilityLink::ContinuationStep,
             "Transform sub_link must be ContinuationStep (chain extension of the Untap clause)",
+        );
+    }
+
+    /// CR 104.3e + CR 603.4 + CR 508.6 + CR 119: Angel of Destiny (issue #1599).
+    /// "At the beginning of your end step, if you have at least 15 life more than
+    /// your starting life total, each player this creature attacked this turn
+    /// loses the game."
+    ///
+    /// Two clauses were silently dropped before this fix:
+    ///   1. The intervening-if (life ≥ starting life + 15) parsed as `None`, so
+    ///      the loss fired every end step regardless of life total.
+    ///   2. The subject "each player this creature attacked this turn" was
+    ///      stripped, leaving `LoseTheGame` with no targets and no `player_scope`
+    ///      — which `win_lose::resolve_lose` routes to the controller (CR 104.3a),
+    ///      making the Angel eliminate its own controller.
+    #[test]
+    fn parse_angel_of_destiny_end_step_loss_issue_1599() {
+        let def = parse_trigger_line(
+            "At the beginning of your end step, if you have at least 15 life more than your starting life total, each player this creature attacked this turn loses the game.",
+            "Angel of Destiny",
+        );
+
+        assert_eq!(def.mode, TriggerMode::Phase);
+        assert_eq!(def.phase, Some(Phase::End));
+
+        // Clause 1 — intervening-if (CR 603.4): LifeAboveStarting ≥ 15, i.e.
+        // current life is at least 15 above the starting life total (CR 119).
+        // Reuses the `LifeAboveStarting` building block (life − starting life).
+        assert_eq!(
+            def.condition,
+            Some(TriggerCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::LifeAboveStarting,
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 15 },
+            }),
+            "condition must be QuantityComparison LifeAboveStarting GE Fixed(15), got {:?}",
+            def.condition,
+        );
+
+        // Clause 2 — effect + player scope: LoseTheGame fanned out over each
+        // player the source creature attacked this turn (CR 508.6). The
+        // controller is excluded by `OpponentAttackedBySourceThisTurn`, so the
+        // Angel never eliminates itself — directly fixing the "my own Angel
+        // killed me" report.
+        let execute = def.execute.as_ref().expect("execute must be Some");
+        assert_eq!(*execute.effect, Effect::LoseTheGame);
+        assert_eq!(
+            execute.player_scope,
+            Some(PlayerFilter::OpponentAttackedBySourceThisTurn),
+            "LoseTheGame must scope to players the source attacked this turn (issue #1599), got {:?}",
+            execute.player_scope,
         );
     }
 
@@ -14968,7 +15124,7 @@ mod tests {
                 // subject by a post-hoc `player_scope` override.
                 assert_eq!(
                     player,
-                    &crate::types::ability::GainLifePlayer::Controller,
+                    &crate::types::ability::TargetFilter::Controller,
                     "Exquisite Blood: 'you gain' recipient must be the ability controller"
                 );
             }
@@ -15403,6 +15559,61 @@ mod tests {
         );
         assert_eq!(def.trigger_zones, vec![Zone::Graveyard]);
         assert!(def.optional);
+    }
+
+    /// CR 109.4: "other than this card" in an exile target must add
+    /// `FilterProp::Another` so the ability source (Ichorid) cannot be used
+    /// to pay its own recursion cost.
+    #[test]
+    fn trigger_ichorid_exile_target_excludes_self() {
+        let def = parse_trigger_line(
+            "At the beginning of your upkeep, if this card is in your graveyard, you may exile a black creature card other than this card from your graveyard. If you do, return this card to the battlefield.",
+            "Ichorid",
+        );
+        assert_eq!(def.mode, TriggerMode::Phase);
+        assert_eq!(def.phase, Some(Phase::Upkeep));
+        assert_eq!(def.trigger_zones, vec![Zone::Graveyard]);
+        let exec = def
+            .execute
+            .expect("Ichorid upkeep trigger must have execute")
+            .effect;
+        let Effect::ChangeZone {
+            ref target,
+            origin,
+            destination,
+            ..
+        } = *exec
+        else {
+            panic!("expected ChangeZone exile, got {exec:?}")
+        };
+        assert_eq!(origin, Some(Zone::Graveyard));
+        assert_eq!(destination, Zone::Exile);
+        let TargetFilter::Typed(ref tf) = *target else {
+            panic!("expected Typed filter, got {target:?}")
+        };
+        assert_eq!(tf.controller, Some(ControllerRef::You));
+        assert!(
+            tf.properties.contains(&FilterProp::Another),
+            "exile target must carry FilterProp::Another for 'other than this card'; got {:?}",
+            tf.properties
+        );
+        assert!(
+            tf.properties.contains(&FilterProp::InZone {
+                zone: Zone::Graveyard
+            }),
+            "exile target must be scoped to your graveyard; got {:?}",
+            tf.properties
+        );
+        assert!(
+            tf.properties.iter().any(|p| matches!(
+                p,
+                FilterProp::HasColor {
+                    color: ManaColor::Black
+                }
+            )),
+            "exile target must require black; got {:?}",
+            tf.properties
+        );
     }
 
     #[test]
@@ -16411,16 +16622,190 @@ mod tests {
     }
 
     #[test]
-    fn trigger_unless_they_pay_binds_each_opponent_to_scoped_controller() {
+    fn trigger_unless_they_pay_binds_each_opponent_to_scoped_player() {
         let def = parse_trigger_line(
             "When this creature enters, each opponent sacrifices a permanent of their choice unless they pay {2}.",
             "Rishadan Footpad",
         );
 
         let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
-        assert_eq!(unless_pay.payer, TargetFilter::Controller);
+        // CR 608.2f: the per-iteration scoped opponent pays, resolved via
+        // `ability.scoped_player` (not `state.active_player` as `Controller`
+        // would yield on a non-active opponent's behalf).
+        assert_eq!(unless_pay.payer, TargetFilter::ScopedPlayer);
         let execute = def.execute.as_ref().expect("should have execute");
         assert_eq!(execute.player_scope, Some(PlayerFilter::Opponent));
+    }
+
+    // CR 118.12a: Trigger-side delegation to `parse_unless_they_alt_cost_chain`
+    // for the disjunctive non-mana unless-cost shape. The payer-pronoun axis
+    // {they, that player, that opponent} x cost {sacrifice <filter>, discard a
+    // card, pay N life}. Asserts the typed `UnlessPayModifier` and the cleaned
+    // effect text — never card names.
+    #[test]
+    fn trigger_unless_they_sacrifice_filter_binds_triggering_player() {
+        let def = parse_trigger_line(
+            "Whenever an opponent casts a spell, that player loses 3 life unless they sacrifice a creature.",
+            "Test Punisher",
+        );
+        let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
+        assert_eq!(unless_pay.payer, TargetFilter::TriggeringPlayer);
+        assert!(
+            matches!(unless_pay.cost, AbilityCost::Sacrifice { count: 1, .. }),
+            "cost should be Sacrifice, got {:?}",
+            unless_pay.cost
+        );
+        let AbilityCost::Sacrifice { target, .. } = &unless_pay.cost else {
+            unreachable!("checked sacrifice cost above");
+        };
+        let TargetFilter::Typed(tf) = target else {
+            panic!("sacrifice target should be typed, got {target:?}");
+        };
+        assert_eq!(tf.controller, Some(ControllerRef::You));
+    }
+
+    #[test]
+    fn trigger_unless_that_player_discards_a_card() {
+        let def = parse_trigger_line(
+            "Whenever an opponent casts a spell, that player loses 3 life unless that player discards a card.",
+            "Test Punisher",
+        );
+        let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
+        assert_eq!(unless_pay.payer, TargetFilter::TriggeringPlayer);
+        assert!(
+            matches!(
+                unless_pay.cost,
+                AbilityCost::Discard {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    filter: None,
+                    random: false,
+                    self_ref: false
+                }
+            ),
+            "cost should be DiscardCard, got {:?}",
+            unless_pay.cost
+        );
+    }
+
+    #[test]
+    fn trigger_unless_that_opponent_pays_life() {
+        let def = parse_trigger_line(
+            "Whenever an opponent casts a spell, that opponent loses 3 life unless that opponent pays 4 life.",
+            "Test Punisher",
+        );
+        let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
+        assert_eq!(unless_pay.payer, TargetFilter::TriggeringPlayer);
+        assert!(
+            matches!(
+                unless_pay.cost,
+                AbilityCost::PayLife {
+                    amount: QuantityExpr::Fixed { value: 4 }
+                }
+            ),
+            "cost should be PayLife(4), got {:?}",
+            unless_pay.cost
+        );
+    }
+
+    #[test]
+    fn trigger_unless_they_disjunctive_sacrifice_or_discard_builds_one_of() {
+        let def = parse_trigger_line(
+            "Whenever an opponent casts a spell, that player loses 3 life unless they sacrifice a nonland permanent or discard a card.",
+            "Test Punisher",
+        );
+        let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
+        assert_eq!(unless_pay.payer, TargetFilter::TriggeringPlayer);
+        let AbilityCost::OneOf { costs } = &unless_pay.cost else {
+            panic!("cost should be OneOf, got {:?}", unless_pay.cost);
+        };
+        assert_eq!(costs.len(), 2, "OneOf should have two branches: {costs:?}");
+        assert!(
+            matches!(costs[0], AbilityCost::Sacrifice { .. }),
+            "first branch should be Sacrifice, got {:?}",
+            costs[0]
+        );
+        let AbilityCost::Sacrifice { target, .. } = &costs[0] else {
+            unreachable!("checked sacrifice branch above");
+        };
+        let TargetFilter::Typed(tf) = target else {
+            panic!("sacrifice target should be typed, got {target:?}");
+        };
+        assert_eq!(tf.controller, Some(ControllerRef::You));
+        assert!(
+            matches!(costs[1], AbilityCost::Discard { .. }),
+            "second branch should be Discard, got {:?}",
+            costs[1]
+        );
+    }
+
+    #[test]
+    fn trigger_unless_each_opponent_sacrifice_binds_scoped_player() {
+        let def = parse_trigger_line(
+            "When this creature enters, each opponent loses 3 life unless they sacrifice a creature.",
+            "Test Scoped Punisher",
+        );
+        let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
+        // CR 608.2f: scoped opponent pays via per-iteration `scoped_player`.
+        assert_eq!(unless_pay.payer, TargetFilter::ScopedPlayer);
+        assert!(
+            matches!(unless_pay.cost, AbilityCost::Sacrifice { count: 1, .. }),
+            "cost should be Sacrifice, got {:?}",
+            unless_pay.cost
+        );
+        let AbilityCost::Sacrifice { target, .. } = &unless_pay.cost else {
+            unreachable!("checked sacrifice cost above");
+        };
+        let TargetFilter::Typed(tf) = target else {
+            panic!("sacrifice target should be typed, got {target:?}");
+        };
+        assert_eq!(tf.controller, Some(ControllerRef::You));
+        let execute = def.execute.as_ref().expect("should have execute");
+        assert_eq!(execute.player_scope, Some(PlayerFilter::Opponent));
+    }
+
+    // NEGATIVE: documented non-goals must NOT be swallowed as unless-pay.
+    #[test]
+    fn trigger_unless_you_mill_is_not_unless_pay() {
+        let def = parse_trigger_line(
+            "When this creature enters, draw a card unless you mill 3.",
+            "Test Card",
+        );
+        assert!(
+            def.unless_pay.is_none(),
+            "mill is an unpayable unless-cost — must not be extracted, got {:?}",
+            def.unless_pay
+        );
+    }
+
+    #[test]
+    fn trigger_unless_you_pay_mana_cost_is_not_unless_pay() {
+        let def = parse_trigger_line(
+            "When this creature enters, draw a card unless you pay its mana cost.",
+            "Test Card",
+        );
+        assert!(
+            def.unless_pay.is_none(),
+            "\"pay its mana cost\" is not a recognized unless-cost, got {:?}",
+            def.unless_pay
+        );
+    }
+
+    // NO-REGRESSION: bare "unless you pay {2}" still routes through the
+    // existing mana block (the "you" pronoun is excluded from the explicit-
+    // pronoun chain), not the new delegation.
+    #[test]
+    fn trigger_unless_you_pay_mana_still_routes_to_mana_block() {
+        let def = parse_trigger_line(
+            "When this creature enters, draw a card unless you pay {2}.",
+            "Test Card",
+        );
+        let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
+        assert_eq!(unless_pay.payer, TargetFilter::Controller);
+        assert!(
+            matches!(unless_pay.cost, AbilityCost::Mana { .. }),
+            "cost should be Mana, got {:?}",
+            unless_pay.cost
+        );
     }
 
     #[test]
@@ -17702,6 +18087,7 @@ mod tests {
                 phase: Phase::Upkeep,
                 after: Phase::Upkeep,
                 followed_by,
+                ..
             }) if followed_by.is_empty()
         ));
     }
@@ -18312,6 +18698,61 @@ mod tests {
         assert_eq!(def.mode, TriggerMode::ChangesZone);
         assert_eq!(def.destination, Some(Zone::Battlefield));
         assert_eq!(def.origin, Some(Zone::Graveyard));
+        let execute = def.execute.as_ref().expect("trigger should have execute");
+        match &*execute.effect {
+            Effect::DealDamage {
+                amount,
+                target,
+                damage_source,
+            } => {
+                assert_eq!(*target, TargetFilter::Any);
+                assert_eq!(*damage_source, Some(DamageSource::TriggeringSource));
+                assert!(matches!(
+                    amount,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::Power {
+                            scope: ObjectScope::EventSource,
+                        },
+                    }
+                ));
+            }
+            other => panic!("expected DealDamage, got {other:?}"),
+        }
+    }
+
+    /// CR 120.1 + CR 603.6: Pyrogoyf's "that creature deals damage equal to
+    /// its power" trigger must use the entering Lhurgoyf as both the damage
+    /// source and power source, while keeping "any target" as the chosen damage
+    /// recipient.
+    #[test]
+    fn pyrogoyf_etb_damage_uses_entering_lhurgoyf_as_damage_source() {
+        let def = parse_trigger_line(
+            "Whenever this creature or another Lhurgoyf creature you control enters, that creature deals damage equal to its power to any target.",
+            "Pyrogoyf",
+        );
+
+        assert_eq!(def.mode, TriggerMode::ChangesZone);
+        assert_eq!(def.destination, Some(Zone::Battlefield));
+        let execute = def.execute.as_ref().expect("trigger should have execute");
+        match &*execute.effect {
+            Effect::DealDamage {
+                amount,
+                target,
+                damage_source,
+            } => {
+                assert_eq!(*target, TargetFilter::Any);
+                assert_eq!(*damage_source, Some(DamageSource::TriggeringSource));
+                assert!(matches!(
+                    amount,
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::Power {
+                            scope: ObjectScope::EventSource,
+                        },
+                    }
+                ));
+            }
+            other => panic!("expected DealDamage, got {other:?}"),
+        }
     }
 
     /// CR 603.6 + CR 603.6a — origin extraction for "enters from exile"
@@ -23056,6 +23497,95 @@ mod tests {
             );
         }
     }
+
+    /// Issue #1592 — Odric, Lunarch Marshal's CURRENT (post-errata) Oracle text:
+    /// the trigger is now "At the beginning of each combat" and the
+    /// "same is true for" list gained `skulk` (13 keywords total). Each grant
+    /// must still be an `IsPresent`-gated `StaticDefinition` (gated on a creature
+    /// you control having that keyword) — NOT an unconditional grant of every
+    /// keyword. This guards the runtime symptom reported in #1592 ("it's getting
+    /// all of the abilities") against the current card text.
+    #[test]
+    fn parse_odric_current_errata_text_gates_all_thirteen_keywords() {
+        use crate::types::keywords::Keyword;
+
+        let def = parse_trigger_line(
+            "At the beginning of each combat, creatures you control gain first \
+             strike until end of turn if a creature you control has first strike. \
+             The same is true for flying, deathtouch, double strike, haste, \
+             hexproof, indestructible, lifelink, menace, reach, skulk, trample, \
+             and vigilance.",
+            "Odric, Lunarch Marshal",
+        );
+        let execute = def.execute.expect("Odric trigger must have an execute");
+        let Effect::GenericEffect {
+            static_abilities, ..
+        } = &*execute.effect
+        else {
+            panic!("expected GenericEffect, got {:?}", execute.effect);
+        };
+        // First strike + 12 "same is true for" keywords = 13 definitions.
+        assert_eq!(
+            static_abilities.len(),
+            13,
+            "expected 13 conditioned StaticDefinitions, got {}",
+            static_abilities.len()
+        );
+        assert!(
+            execute.sub_ability.is_none(),
+            "the 'same is true for' sentence must fold into static_abilities"
+        );
+
+        let expected = [
+            Keyword::FirstStrike,
+            Keyword::Flying,
+            Keyword::Deathtouch,
+            Keyword::DoubleStrike,
+            Keyword::Haste,
+            Keyword::Hexproof,
+            Keyword::Indestructible,
+            Keyword::Lifelink,
+            Keyword::Menace,
+            Keyword::Reach,
+            Keyword::Skulk,
+            Keyword::Trample,
+            Keyword::Vigilance,
+        ];
+        for (sdef, keyword) in static_abilities.iter().zip(expected.iter()) {
+            // Grant: one AddKeyword for this keyword.
+            assert!(
+                sdef.modifications.iter().any(|m| matches!(
+                    m,
+                    ContinuousModification::AddKeyword { keyword: k } if k == keyword
+                )),
+                "static def must grant {keyword:?}, mods: {:?}",
+                sdef.modifications
+            );
+            // Gate: IsPresent of a creature YOU CONTROL with the SAME keyword.
+            let Some(crate::types::ability::StaticCondition::IsPresent {
+                filter: Some(TargetFilter::Typed(tf)),
+            }) = &sdef.condition
+            else {
+                panic!(
+                    "static def for {keyword:?} must be IsPresent-gated, got {:?}",
+                    sdef.condition
+                );
+            };
+            assert!(
+                tf.properties.iter().any(|p| matches!(
+                    p,
+                    FilterProp::WithKeyword { value } if value == keyword
+                )),
+                "gate for {keyword:?} must check WithKeyword({keyword:?}), props: {:?}",
+                tf.properties
+            );
+            assert_eq!(
+                tf.controller,
+                Some(crate::types::ability::ControllerRef::You),
+                "gate for {keyword:?} must be scoped to creatures you control"
+            );
+        }
+    }
 }
 
 /// Snapshot tests locking current trigger parser output before the IR split.
@@ -23078,6 +23608,98 @@ mod snapshot_tests {
             "Test Card",
         );
         insta::assert_json_snapshot!(def);
+    }
+
+    /// CR 608.2c (issue #1584): Kathril's "Repeat this process for <10 keywords>"
+    /// must replicate the conditional keyword-counter placement once per keyword
+    /// — each placing that keyword's counter gated on a creature card in the
+    /// graveyard with the SAME keyword — instead of silently dropping the list.
+    #[test]
+    fn kathril_repeats_keyword_counters_across_graveyard_keywords() {
+        use crate::types::ability::{Effect, FilterProp, QuantityExpr, QuantityRef, TargetFilter};
+        use crate::types::counter::CounterType;
+        use crate::types::keywords::{Keyword, KeywordKind};
+
+        fn condition_keyword(cond: &AbilityCondition) -> Option<Keyword> {
+            let AbilityCondition::QuantityCheck { lhs, .. } = cond else {
+                return None;
+            };
+            let QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount { filter },
+            } = lhs
+            else {
+                return None;
+            };
+            let TargetFilter::Typed(typed) = filter else {
+                return None;
+            };
+            typed.properties.iter().find_map(|prop| match prop {
+                FilterProp::WithKeyword { value } => Some(value.clone()),
+                _ => None,
+            })
+        }
+
+        let def = parse_trigger_line(
+            "When Kathril enters, put a flying counter on any creature you control \
+             if a creature card in your graveyard has flying. Repeat this process \
+             for first strike, double strike, deathtouch, hexproof, indestructible, \
+             lifelink, menace, reach, trample, and vigilance. Then put a +1/+1 \
+             counter on Kathril for each counter put on a creature this way.",
+            "Kathril, Aspect Warper",
+        );
+
+        // Walk the execute chain, collecting each keyword counter with the
+        // keyword its graveyard gate checks.
+        let mut node = def.execute.as_deref();
+        let mut keyword_counters: Vec<(KeywordKind, KeywordKind)> = Vec::new();
+        let mut saw_p1p1 = false;
+        while let Some(d) = node {
+            if let Effect::PutCounter { counter_type, .. } = &*d.effect {
+                match counter_type {
+                    CounterType::Keyword(kind) => {
+                        let cond_kw = d
+                            .condition
+                            .as_ref()
+                            .and_then(condition_keyword)
+                            .expect("keyword counter keeps its graveyard-keyword gate");
+                        keyword_counters.push((*kind, cond_kw.kind()));
+                    }
+                    CounterType::Plus1Plus1 => saw_p1p1 = true,
+                    other => panic!("unexpected counter type {other:?}"),
+                }
+            }
+            node = d.sub_ability.as_deref();
+        }
+
+        let expected = [
+            KeywordKind::Flying,
+            KeywordKind::FirstStrike,
+            KeywordKind::DoubleStrike,
+            KeywordKind::Deathtouch,
+            KeywordKind::Hexproof,
+            KeywordKind::Indestructible,
+            KeywordKind::Lifelink,
+            KeywordKind::Menace,
+            KeywordKind::Reach,
+            KeywordKind::Trample,
+            KeywordKind::Vigilance,
+        ];
+        assert_eq!(
+            keyword_counters.len(),
+            expected.len(),
+            "all 11 keyword counters present (flying + the 10 repeated)"
+        );
+        for ((counter_kw, gate_kw), exp) in keyword_counters.iter().zip(expected) {
+            assert_eq!(*counter_kw, exp, "placed counter keyword matches the list");
+            assert_eq!(
+                *gate_kw, exp,
+                "the graveyard gate checks the SAME keyword as the placed counter"
+            );
+        }
+        assert!(
+            saw_p1p1,
+            "the +1/+1-on-Kathril follow-up survives the expansion"
+        );
     }
 
     #[test]

@@ -9,8 +9,8 @@ use nom::Parser;
 use crate::types::ability::{
     AggregateFunction, AttachmentKind, CombatRelation, CombatRelationSubject, Comparator,
     ControllerRef, FilterProp, ObjectProperty, ObjectScope, PtStat, PtValueScope, QuantityExpr,
-    QuantityRef, SharedQuality, SharedQualityRelation, TargetFilter, TargetSelectionMode,
-    TypeFilter, TypedFilter,
+    QuantityRef, SeatDirection, SharedQuality, SharedQualityRelation, TargetFilter,
+    TargetSelectionMode, TypeFilter, TypedFilter,
 };
 use crate::types::card_type::Supertype;
 use crate::types::counter::{CounterMatch, CounterType};
@@ -797,6 +797,22 @@ pub fn parse_target_with_syntax<'a>(
                 TargetFilter::ParentTargetSlot { index: 0 },
                 tag("the second player"),
             ),
+            // CR 102.1 + CR 103.1: "the player to your right/left" —
+            // seating-relative neighbor. Right = previous seat (clockwise turn
+            // order proceeds to the left). Placed before the bare "the player"
+            // arm so the longer phrase wins under longest-match-first dispatch.
+            value(
+                TargetFilter::Neighbor {
+                    direction: SeatDirection::Right,
+                },
+                tag("the player to your right"),
+            ),
+            value(
+                TargetFilter::Neighbor {
+                    direction: SeatDirection::Left,
+                },
+                tag("the player to your left"),
+            ),
             value(TargetFilter::ParentTarget, tag("the player")),
             value(TargetFilter::ParentTarget, tag("the creature")),
             value(TargetFilter::ParentTarget, tag("the spell")),
@@ -947,21 +963,45 @@ pub fn parse_target_with_syntax<'a>(
         );
     }
 
-    // "each of those creatures/permanents/cards" → TrackedSet reference
-    if let Ok((rest, _)) = alt((
-        tag::<_, _, OracleError<'_>>("each of those creatures"),
-        tag("each of those permanents"),
-        tag("each of those cards"),
-    ))
-    .parse(lower.as_str())
+    // CR 608.2c: "each of those <type>" — anaphoric reference to objects
+    // affected by a preceding instruction in the same ability (Urge to Feed:
+    // vampires tapped for the optional cost; Zimone-class "revealed this way"
+    // uses the bare creatures/permanents/cards arms). A typed tail ("Vampires",
+    // "Zombies you control") intersects the tracked set with the type filter;
+    // without this arm, "each of those Vampires" fell through to `each ` +
+    // `parse_type_phrase("of those Vampires")`, producing an empty TypedFilter
+    // that matched every permanent on the battlefield.
+    if let Ok((rest_lower, _)) =
+        tag::<_, _, OracleError<'_>>("each of those ").parse(lower.as_str())
     {
-        return (
-            TargetFilter::TrackedSet {
-                id: TrackedSetId(0),
-            },
-            &text[lower.len() - rest.len()..],
-            syntax,
-        );
+        let phrase_start = lower.len() - rest_lower.len();
+        let phrase = &text[phrase_start..];
+        if let Ok((rest_lower, _)) = alt((
+            tag::<_, _, OracleError<'_>>("creatures"),
+            tag("permanents"),
+            tag("cards"),
+        ))
+        .parse(rest_lower)
+        {
+            return (
+                TargetFilter::TrackedSet {
+                    id: TrackedSetId(0),
+                },
+                &text[lower.len() - rest_lower.len()..],
+                syntax,
+            );
+        }
+        let (filter, remainder) = parse_type_phrase_with_ctx(phrase, ctx);
+        if target_filter_has_meaningful_content(&filter) {
+            return (
+                TargetFilter::TrackedSetFiltered {
+                    id: TrackedSetId(0),
+                    filter: Box::new(filter),
+                },
+                remainder,
+                syntax,
+            );
+        }
     }
 
     // "each " + type phrase
@@ -2435,7 +2475,12 @@ fn distribute_properties_to_or(filter: TargetFilter) -> TargetFilter {
 /// to all preceding `Typed` elements that have `controller: None`.
 /// Handles "artifacts, creatures, and lands your opponents control" where only
 /// the final type parses the controller suffix.
-fn distribute_controller_to_or(filter: TargetFilter) -> TargetFilter {
+///
+/// Exposed `pub(crate)` so disjunctive grammars that compose their own `Or` from
+/// independently-parsed disjuncts (e.g. the trigger-doubler source filter in
+/// `oracle_static::evasion`, "a Shaman or another Wizard you control") can reuse
+/// the same shared-controller-scope distribution instead of duplicating it.
+pub(crate) fn distribute_controller_to_or(filter: TargetFilter) -> TargetFilter {
     let TargetFilter::Or { mut filters } = filter else {
         return filter;
     };
@@ -2790,34 +2835,25 @@ fn parse_superlative_property_suffix(
     ctx: &mut ParseContext,
 ) -> Option<(FilterProp, usize)> {
     let trimmed = text.trim_start();
-    let (rest, (function, property)) = alt((
+    // "with the <greatest|highest> <property> among " — greatest/highest are
+    // synonyms (both AggregateFunction::Max), property is the second axis.
+    // Factor the 2×3 cross product into two alts (PATTERNS.md §8b).
+    let (rest, (function, property)) = (
+        tag::<_, _, OracleError<'_>>("with the "),
         value(
-            (AggregateFunction::Max, ObjectProperty::Power),
-            tag::<_, _, OracleError<'_>>("with the greatest power among "),
+            AggregateFunction::Max,
+            alt((tag("greatest "), tag("highest "))),
         ),
-        value(
-            (AggregateFunction::Max, ObjectProperty::Power),
-            tag("with the highest power among "),
-        ),
-        value(
-            (AggregateFunction::Max, ObjectProperty::Toughness),
-            tag("with the greatest toughness among "),
-        ),
-        value(
-            (AggregateFunction::Max, ObjectProperty::Toughness),
-            tag("with the highest toughness among "),
-        ),
-        value(
-            (AggregateFunction::Max, ObjectProperty::ManaValue),
-            tag("with the greatest mana value among "),
-        ),
-        value(
-            (AggregateFunction::Max, ObjectProperty::ManaValue),
-            tag("with the highest mana value among "),
-        ),
-    ))
-    .parse(trimmed)
-    .ok()?;
+        alt((
+            value(ObjectProperty::Power, tag("power")),
+            value(ObjectProperty::Toughness, tag("toughness")),
+            value(ObjectProperty::ManaValue, tag("mana value")),
+        )),
+        tag(" among "),
+    )
+        .parse(trimmed)
+        .map(|(rest, (_, function, property, _))| (rest, (function, property)))
+        .ok()?;
     // Delegate the "<type-set> <controller> control(s)" clause to the
     // authoritative type-phrase combinator — it parses the multi-type
     // or/and list, any leading article, and the trailing controller suffix.
@@ -6697,6 +6733,41 @@ mod tests {
         assert_eq!(rest, "");
     }
 
+    /// Issue #1338: "each of those Vampires" must intersect the tracked tap set,
+    /// not degenerate to an empty TypedFilter over the whole battlefield.
+    #[test]
+    fn each_of_those_vampires_is_tracked_set_filtered() {
+        use crate::types::TypeFilter;
+        let (filter, rest) = parse_target("each of those Vampires");
+        match filter {
+            TargetFilter::TrackedSetFiltered { id, filter } => {
+                assert_eq!(id, TrackedSetId(0));
+                match *filter {
+                    TargetFilter::Typed(tf) => {
+                        assert!(tf
+                            .type_filters
+                            .contains(&TypeFilter::Subtype("Vampire".into())));
+                    }
+                    other => panic!("expected Typed Vampire filter, got {other:?}"),
+                }
+            }
+            other => panic!("expected TrackedSetFiltered, got {other:?}"),
+        }
+        assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn each_of_those_creatures_is_tracked_set() {
+        let (filter, rest) = parse_target("each of those creatures");
+        assert!(matches!(
+            filter,
+            TargetFilter::TrackedSet {
+                id: TrackedSetId(0)
+            }
+        ));
+        assert_eq!(rest, "");
+    }
+
     #[test]
     fn definite_artifact_reference_binds_first_parent_target_slot() {
         let (filter, rest) = parse_target("the artifact and returns it");
@@ -9512,6 +9583,33 @@ mod tests {
         assert!(tf.type_filters.contains(&TypeFilter::Artifact));
         assert!(tf.type_filters.contains(&TypeFilter::Creature));
         assert_eq!(tf.controller, Some(ControllerRef::You));
+    }
+
+    /// CR 102.1 + CR 103.1: "the player to your right/left" parses to a
+    /// seating-relative `Neighbor` filter. Right = previous seat (clockwise
+    /// turn order proceeds to the left).
+    #[test]
+    fn parse_target_player_to_your_right_is_neighbor_right() {
+        let (f, rest) = parse_target("the player to your right");
+        assert_eq!(
+            f,
+            TargetFilter::Neighbor {
+                direction: SeatDirection::Right
+            }
+        );
+        assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn parse_target_player_to_your_left_is_neighbor_left() {
+        let (f, rest) = parse_target("the player to your left");
+        assert_eq!(
+            f,
+            TargetFilter::Neighbor {
+                direction: SeatDirection::Left
+            }
+        );
+        assert_eq!(rest, "");
     }
 
     #[test]
